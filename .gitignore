@@ -24,3 +24,9 @@ logs/
 sessions/
 backups/
 .DS_Store
+
+# Private host material is stored outside this repository
+profile.patch
+source-releases/
+deployment-private/
+native-inputs.json
