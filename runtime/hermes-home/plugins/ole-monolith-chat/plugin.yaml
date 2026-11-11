@@ -1,0 +1,3 @@
+name: ole-monolith-chat
+version: 0.1.0
+description: Native owner-bound Monolith chat with leased claims and durable reply receipts

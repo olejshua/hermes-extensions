@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Hermes Memory Graph</title>
+    <link rel="stylesheet" href="/assets/style.css">
+  </head>
+  <body>
+    <main class="shell">
+      <aside class="panel">
+        <div class="brand">
+          <span class="mark"></span>
+          <div>
+            <h1>Memory Graph</h1>
+            <p id="summary">Loading local graph</p>
+          </div>
+        </div>
+        <label class="search">
+          <span>Search</span>
+          <input id="search" autocomplete="off" placeholder="Namespace, folder, resource">
+        </label>
+        <section>
+          <h2>Type</h2>
+          <div id="typeFilters" class="checks"></div>
+        </section>
+        <section>
+          <h2>Namespace</h2>
+          <div id="namespaceFilters" class="checks"></div>
+        </section>
+        <section class="detail">
+          <h2>Selection</h2>
+          <dl id="details"></dl>
+        </section>
+      </aside>
+      <section class="stage">
+        <div class="toolbar">
+          <button id="fit" type="button" title="Fit graph">Fit</button>
+          <button id="reset" type="button" title="Reset view">Reset</button>
+          <button id="refresh" type="button" title="Refresh data">Refresh</button>
+        </div>
+        <canvas id="graph"></canvas>
+      </section>
+    </main>
+    <script src="/assets/app.js"></script>
+  </body>
+</html>

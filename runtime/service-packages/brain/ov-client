@@ -1,0 +1,3 @@
+#!/bin/sh
+export OPENVIKING_CLI_CONFIG_FILE=/home/hermes/hermes-extensions-staging/brain/ovcli.conf
+exec /home/hermes/hermes-extensions-staging/brain/venv/bin/ov "$@"

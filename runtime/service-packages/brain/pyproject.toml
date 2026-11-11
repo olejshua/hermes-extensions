@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-second-brain"
+version = "0.1.0"
+description = "Manifest-driven local second brain sync for Hermes and OpenViking"
+requires-python = ">=3.11"
+authors = [{name = "Hermes Second Brain contributors"}]
+readme = "README.md"
+dependencies = ["PyYAML==6.0.3"]
+
+[project.optional-dependencies]
+signal-desktop = ["cryptography>=42"]
+macos-contacts = ["pyobjc-framework-Contacts>=10; platform_system == 'Darwin'"]
+
+[project.scripts]
+hermes-second-brain = "hermes_second_brain.cli:main"
+context-alerts = "hermes_second_brain.cli:context_alerts_main"
+context-daily-brief = "hermes_second_brain.cli:context_daily_brief_main"
+context-feedback = "hermes_second_brain.cli:context_feedback_main"
+personal-message = "hermes_second_brain.personal_messaging:main"
+signal-desktop-history = "hermes_second_brain.signal_desktop:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+hermes_second_brain = ["*.json", "assets/*.html", "assets/*.css", "assets/*.js"]
+
+[tool.hermes-second-brain]
+test-command = "PYTHONPATH=src python3.11 -m unittest discover -s tests"

@@ -1,0 +1,26 @@
+# Local configuration and state
+.env
+.env.*
+!.env.example
+auth.json
+auth-store.json
+credentials*.json
+client_secret*.json
+config.yaml
+config.yml
+*.pem
+*.key
+*.sqlite
+*.sqlite3
+*.db
+*.log
+*.pyc
+__pycache__/
+.venv/
+venv/
+node_modules/
+state/
+logs/
+sessions/
+backups/
+.DS_Store
