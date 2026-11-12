@@ -12,6 +12,18 @@ from .state import _receipt
 GRANTS={'ole-approved':'approved-documents-2026-10-08','ole_unconfirmed':'remaining-vault-context-2026-10-08'}
 
 
+def grant_sources(manifest):
+ # Sources outside the export-grant model (e.g. namespace 'dreams') carry
+ # their own approval proof - publication receipts verified by dream_sync.
+ # This refresh must neither fail on their missing export grants nor index
+ # them here; their own verified pipeline owns them.
+ return [source for source in manifest.sources if source.namespace in GRANTS]
+
+
+def grant_source_ids(manifest):
+ return {source.id for source in grant_sources(manifest)}
+
+
 def failure_result(exc):
  # Only code-authored exact literals become diagnostic codes. Never render str(exc):
  # native TimeoutExpired/SDK messages can contain private query/request material.
@@ -27,7 +39,7 @@ def failure_result(exc):
 def snapshot(manifest,grants):
  active={g['id']for g in json.loads(Path(grants).read_text()).get('grants',[])if g.get('active')is True}
  packets={};records={};expected={}
- for source in manifest.sources:
+ for source in grant_sources(manifest):
   if GRANTS.get(source.namespace)not in active or not source.root.is_dir()or not source.approval_receipts:raise RuntimeError('Source grant or export unavailable')
   packet=json.loads(source.approval_receipts.read_text());age=time.time()-packet['generated_at']
   if packet.get('version')!=1 or not -60<=age<=1800:raise RuntimeError('Source receipt unavailable or expired')
@@ -166,7 +178,8 @@ def refresh(manifest_path,grants,readiness,max_resources=40,max_seconds=480,allo
     if row['namespace']!='ole_unconfirmed':approved.append(sid);summary['blocked_approved']+=1;continue
     c.execute("UPDATE resources SET status='deleted',error=NULL WHERE source_id=? AND sha256=?",(sid,row['sha256']));c.commit();changed_count+=1;summary['deleted']+=1
    lexical_refresh(m)
-   rows=c.execute("SELECT * FROM resources WHERE status='synced'").fetchall()
+   rows=[r for r in c.execute("SELECT * FROM resources WHERE status='synced'").fetchall()
+         if r['source_root_id'] in grant_source_ids(m)]
    current={r['source_id']:r for r in rows};summary['remaining_unconfirmed']=sum(source.namespace=='ole_unconfirmed'and(sid not in current or current[sid]['sha256']!=record.get('export_sha256',record['sha256']))for sid,(source,_,record,_)in records.items())
    readiness_path=Path(readiness);before=digest(readiness_path.read_bytes())if readiness_path.exists()else None
    summary['readiness_current'],summary['phase']=advance_readiness(m,Path(manifest_path),Path(grants),readiness_path,packets,records,expected,proofs,rows)

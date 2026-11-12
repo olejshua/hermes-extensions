@@ -9,6 +9,7 @@ import importlib.util
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -351,6 +352,54 @@ class SearchSnippetTests(unittest.TestCase):
         text = 'Das Ergebnis steht in Wochentagslogik verankert.\nMehr Text ohne Treffer.\n'
         start, end = self.span(text, [(0, len(text))], {'tag'})
         self.assertIn('Wochentagslogik', text[start:end])
+
+
+class NativeRefreshNamespaceTests(unittest.TestCase):
+    """Dream artifacts carry publication receipts, not export grants; the
+    refresh must skip their namespace instead of failing the whole run."""
+
+    def _manifest(self, sources):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / 'docs').mkdir()
+        (root / 'dreams').mkdir()
+        (root / 'receipts.json').write_text(json.dumps(
+            {'version': 1, 'generated_at': time.time(), 'records': {}}))
+        (root / 'grants.json').write_text(json.dumps(
+            {'grants': [{'id': 'approved-documents-2026-10-08', 'active': True}]}))
+        path = root / 'manifest.json'
+        resolved = [{k: (v.format(root=root) if isinstance(v, str) else v)
+                     for k, v in source.items()} for source in sources]
+        path.write_text(json.dumps({'sources': resolved}))
+        from hermes_second_brain.manifest import load_manifest
+        return load_manifest(path), root
+
+    def test_mixed_manifest_refreshes_grant_sources_only(self):
+        manifest, root = self._manifest([
+            {'id': 'approved', 'root': '{root}/docs', 'namespace': 'ole-approved',
+             'approval_receipts': '{root}/receipts.json'},
+            {'id': 'dream-conclusions', 'root': '{root}/dreams', 'namespace': 'dreams'},
+        ])
+        from hermes_second_brain.native_refresh import snapshot, grant_sources
+        self.assertEqual([s.id for s in grant_sources(manifest)], ['approved'])
+        packets, records, expected = snapshot(manifest, root / 'grants.json')
+        self.assertEqual(list(packets), ['approved'])
+
+    def test_dreams_only_manifest_needs_no_export_grant(self):
+        manifest, root = self._manifest([
+            {'id': 'dream-conclusions', 'root': '{root}/dreams', 'namespace': 'dreams'},
+        ])
+        from hermes_second_brain.native_refresh import snapshot
+        snapshot(manifest, root / 'grants.json')
+
+    def test_grant_source_still_fails_closed_without_receipts(self):
+        manifest, root = self._manifest([
+            {'id': 'approved', 'root': '{root}/docs', 'namespace': 'ole-approved'},
+        ])
+        from hermes_second_brain.native_refresh import snapshot
+        with self.assertRaises(RuntimeError):
+            snapshot(manifest, root / 'grants.json')
 
 
 if __name__ == '__main__':
