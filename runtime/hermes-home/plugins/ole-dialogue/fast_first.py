@@ -4,13 +4,57 @@ No language classifier or extra router call. The main model answers normally or
 uses native tools; every later API request keeps the configured thorough effort.
 """
 from copy import deepcopy
+import hashlib
 import json
+import re
 import threading
 import weakref
 
 NAME = 'dialogue_thorough'
 PARAMETERS = {'type': 'object', 'properties': {}, 'additionalProperties': False}
 SAFE = frozenset(('dialogue_read', 'dialogue_read_page', 'skill_view', 'read_file', 'search_files', NAME))
+DEFAULT_CASUAL_SKIP_KEYWORDS = ('acribic', 'stealth')
+CASUAL_SKIP_MAX_CHARS = 160
+# Positive smalltalk whitelist: the absence of project keywords alone never
+# makes a message casual. A short question or instruction ("verschieb den
+# Termin auf 15 Uhr") keeps the complete preload even without a keyword.
+_CASUAL_UNIT = (
+    r'(?:guten (?:morgen|tag|abend)|gute nacht|vielen dank|'
+    r'danke(?: (?:dir|schön|sehr|vielmals))*|'
+    r'alles klar|bis (?:später|bald|morgen|gleich|dann)|wie geht.?s(?: dir)?|'
+    r'mach.?s gut|schönen? (?:tag|abend|feierabend)|kein problem|keine sorge|'
+    r'passt(?: so)?|einverstanden|verstanden|liebe grüße|'
+    r'hallo|hi+|hey+|moin+|servus|na|ok(?:ay)?|ja|jap|nein|nee|gut|super|'
+    r'perfekt|toll|klar|bitte|gerne|ciao|tschüss|lg)')
+_CASUAL_PHRASES = re.compile(r'^' + _CASUAL_UNIT + r'(?: ' + _CASUAL_UNIT + r')*$')
+_CASUAL_EDGE = re.compile(r'[\W_\d]+', re.UNICODE)
+
+
+def casual_candidate(message, keywords=DEFAULT_CASUAL_SKIP_KEYWORDS):
+    """A clearly casual short message needs no router run or skill preload.
+
+    The fast first inference already defers every executing tool to the
+    thorough continuation, so skipping the project-context preload for
+    smalltalk removes its latency without touching any source or permission
+    gate. Casual means a positive whitelist match (greeting, thanks,
+    acknowledgement, pure emoji); anything long, multi-line, naming a project
+    or carrying a question or instruction keeps the complete preload
+    unchanged, even when it contains no keyword.
+    """
+    if not isinstance(message, str):
+        return False
+    text = message.strip()
+    if not text or len(text) > CASUAL_SKIP_MAX_CHARS or '\n' in text:
+        return False
+    low = text.casefold()
+    if any(isinstance(word, str) and word and word.casefold() in low for word in keywords):
+        return False
+    normalized = ' '.join(_CASUAL_EDGE.sub(' ', low).split())
+    if not normalized:
+        return True  # pure emoji/punctuation reaction
+    return _CASUAL_PHRASES.match(normalized) is not None
+
+
 GUIDANCE = '''\n\n[Current human conversation request]
 All preceding rules, memory, original history and permissions still apply in full.
 Answer the actual question directly and naturally if the available context supports
@@ -26,9 +70,12 @@ original authorization, source requirements and user corrections remain mandator
 
 
 class FastFirst:
-    def __init__(self, reads, *, enabled=False, effort='low', source_prefetch=False):
+    def __init__(self, reads, *, enabled=False, effort='low', source_prefetch=False,
+                 casual_skip=True, casual_keywords=DEFAULT_CASUAL_SKIP_KEYWORDS):
         self.reads, self.enabled, self.effort = reads, enabled is True, effort
         self.source_prefetch = source_prefetch is True
+        self.casual_skip = casual_skip is True
+        self.casual_keywords = tuple(casual_keywords)
         self.lock = threading.RLock()
         self.rows = weakref.WeakKeyDictionary()
         self.contexts = weakref.WeakKeyDictionary()
@@ -43,8 +90,13 @@ class FastFirst:
             actor=self.actor(session_id,turn_id)
         except ValueError:
             return None
-        source=(self.reads.project_context.read(user_message,include_originals=True) if self.source_prefetch
-                else self.reads.project_context.read(user_message))
+        if self.casual_skip and casual_candidate(user_message, self.casual_keywords):
+            source=dict(read_only=True,complete=True,routing_executed=False,casual_skip=True,
+                        task_sha256=hashlib.sha256(user_message.encode()).hexdigest(),
+                        reason='casual_message_preload_skipped')
+        else:
+            source=(self.reads.project_context.read(user_message,include_originals=True) if self.source_prefetch
+                    else self.reads.project_context.read(user_message))
         from .project_context import preload_text
         with self.lock:
             self.contexts[actor]=dict(turn=turn_id,task=user_message,source=source,text=preload_text(source))
@@ -136,7 +188,7 @@ class FastFirst:
         if (api_call_count != 1 or self.effort != 'low'
                 or not isinstance(request.get('reasoning'),dict)
                 or request['reasoning'].get('effort')!='high'
-                or source.get('routing_executed') is not True
+                or (source.get('routing_executed') is not True and source.get('casual_skip') is not True)
                 or source.get('missing_required_files')):
             with self.lock:
                 previous = self.rows.get(actor)
@@ -287,7 +339,13 @@ class FastFirst:
 def register(ctx, reads):
     if ctx.get_config('fast_first_enabled', False) is not True:
         return None
-    fast = FastFirst(reads, enabled=True,source_prefetch=ctx.get_config('source_prefetch_enabled',False))
+    keywords = ctx.get_config('fast_first_casual_skip_keywords', None)
+    if (not isinstance(keywords, (list, tuple)) or not keywords
+            or any(not isinstance(word, str) or not word.strip() for word in keywords)):
+        keywords = DEFAULT_CASUAL_SKIP_KEYWORDS
+    fast = FastFirst(reads, enabled=True,source_prefetch=ctx.get_config('source_prefetch_enabled',False),
+                     casual_skip=ctx.get_config('fast_first_casual_skip',True) is not False,
+                     casual_keywords=keywords)
     fast.manager = ctx._manager
     ctx.register_tool(name=NAME, toolset='ole-dialogue', schema=dict(name=NAME,
         description='Continue the original current human request with configured thorough reasoning. '

@@ -232,5 +232,50 @@ class BriefingLeadTests(unittest.TestCase):
 
 
 
+class CasualSkipTests(unittest.TestCase):
+    def test_short_casual_message_skips_preload(self):
+        self.assertTrue(fast_first.casual_candidate('danke!'))
+        self.assertTrue(fast_first.casual_candidate('Hi'))
+        self.assertTrue(fast_first.casual_candidate('Guten Morgen'))
+        self.assertTrue(fast_first.casual_candidate('ok 👍'))
+        self.assertTrue(fast_first.casual_candidate('👍'))
+        self.assertTrue(fast_first.casual_candidate('Alles klar, danke dir'))
+
+    def test_project_keyword_long_multiline_or_empty_keep_full_preload(self):
+        self.assertFalse(fast_first.casual_candidate('Block morgen 14-16 Uhr für Acribic'))
+        self.assertFalse(fast_first.casual_candidate('Was läuft bei Stealth?'))
+        self.assertFalse(fast_first.casual_candidate('x' * 161))
+        self.assertFalse(fast_first.casual_candidate('Erste Zeile\nZweite Zeile'))
+        self.assertFalse(fast_first.casual_candidate('   '))
+        self.assertFalse(fast_first.casual_candidate(None))
+        # Short but substantive: a question or instruction never skips the
+        # preload, even without a project keyword.
+        self.assertFalse(fast_first.casual_candidate('Hi, wie sieht morgen aus?'))
+        self.assertFalse(fast_first.casual_candidate('verschieb den Termin auf 15 Uhr'))
+        self.assertFalse(fast_first.casual_candidate('Danke, aber bitte kurz die Mail prüfen'))
+        self.assertFalse(fast_first.casual_candidate('Hat er geantwortet?'))
+
+    def test_keywords_match_casefolded_and_skip_defaults_on(self):
+        self.assertFalse(fast_first.casual_candidate('ACRIBIC Update bitte'))
+        instance = fast_first.FastFirst(object(), enabled=True)
+        self.assertTrue(instance.casual_skip)
+        disabled = fast_first.FastFirst(object(), enabled=True, casual_skip=False)
+        self.assertFalse(disabled.casual_skip)
+
+
+class DialogueStyleTests(unittest.TestCase):
+    """The terse format is scoped to status/control replies, not substance."""
+
+    def test_role_scopes_short_form_and_keeps_substance_complete(self):
+        policy = load('ole_dialogue_policy_under_test',
+                      REPO / 'runtime/hermes-home/plugins/ole-dialogue/policy.py')
+        self.assertIn('Kurzform nur für Status-, Job- und Steuerungsantworten', policy.ROLE)
+        self.assertIn('Inhaltliche Fragen vollständig und natürlich beantworten', policy.ROLE)
+        # Safety constraints survive the style change.
+        self.assertIn('konkreter Freigabe', policy.ROLE)
+        self.assertIn('Keine Emojis', policy.ROLE)
+
+
+
 if __name__ == '__main__':
     unittest.main()
