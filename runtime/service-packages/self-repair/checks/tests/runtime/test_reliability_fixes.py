@@ -320,5 +320,38 @@ class SelfRepairRetryTests(unittest.TestCase):
         self.assertIn('same_feedback_already_tried', source)
 
 
+class SearchSnippetTests(unittest.TestCase):
+    """The lexical excerpt must show the decisive passage, not the loudest line."""
+
+    def setUp(self):
+        from hermes_second_brain.ole_search import lexical_span
+        self.span = lexical_span
+
+    def test_decisive_passage_beats_keyword_dense_noise(self):
+        noise = 'Montag Dienstag Mittwoch Donnerstag Freitag Samstag Sonntag Wochentag\n'
+        decisive = 'Der Termin mit Example GmbH wurde auf den 20. November verschoben.\n'
+        filler = 'Allgemeine Notizen ohne besonderen Inhalt.\n' * 3
+        text = noise + filler + decisive + filler
+        start, end = self.span(text, [(0, len(text))], {'termin', 'example'})
+        excerpt = text[start:end]
+        self.assertIn('Example GmbH', excerpt)
+        self.assertIn('20. November', excerpt)
+
+    def test_compound_head_still_matches(self):
+        text = 'Zur Terminabsage vom gestrigen Tag: sie bleibt bestehen.\nMehr Text.\n'
+        start, end = self.span(text, [(0, len(text))], {'termin'})
+        self.assertIn('Terminabsage', text[start:end])
+
+    def test_single_long_line_truncated_not_skipped(self):
+        text = 'x' * 5000 + ' wichtig\n'
+        start, end = self.span(text, [(0, len(text))], {'wichtig'})
+        self.assertEqual((start, end), (0, 2400))
+
+    def test_containment_fallback_when_no_prefix_match(self):
+        text = 'Das Ergebnis steht in Wochentagslogik verankert.\nMehr Text ohne Treffer.\n'
+        start, end = self.span(text, [(0, len(text))], {'tag'})
+        self.assertIn('Wochentagslogik', text[start:end])
+
+
 if __name__ == '__main__':
     unittest.main()

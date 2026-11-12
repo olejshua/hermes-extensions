@@ -5,6 +5,44 @@ from .ole_policy import verified_record,digest
 from .state import State
 from .memory_access import checked_record,historical_snapshot,section_spans,read_original,source_allowed
 
+def _lexical_weights(lines,terms):
+ # Token-prefix matching: German compounds keep their head noun, so
+ # 'Terminabsage' still matches 'termin', while unrelated containment
+ # ('Montag' matching 'tag') no longer inflates a line's weight.
+ prefix=[sum(1 for word in re.findall(r'\w+',line.casefold()) for term in terms if word.startswith(term)) for line in lines]
+ if any(prefix):return prefix
+ # Suffix-only compounds would otherwise go dark; keep the old containment
+ # reading as the fallback.
+ return [sum(1 for term in terms if term in line.casefold()) for line in lines]
+
+
+def lexical_span(text,ranges,terms):
+ """Best contiguous evidence window, not a single peak line plus fixed offset.
+
+ A keyword-dense but inconclusive line no longer anchors the excerpt; the
+ window with the highest combined line weights wins, so the decisive passage
+ stays inside the quote even when it sits before or after the loudest line.
+ """
+ for begin,stop in sorted(ranges,key=lambda span:-sum(t in text[span[0]:span[1]].casefold() for t in terms)):
+  lines=text[begin:stop].splitlines(keepends=True)
+  weights=_lexical_weights(lines,terms)
+  best=None;total=0;length=0;left=0
+  for right,line in enumerate(lines):
+   total+=weights[right];length+=len(line)
+   while length>2400 and left<right:
+    total-=weights[left];length-=len(lines[left]);left+=1
+   score=(total,-left)
+   if best is None or score>best[0]:best=(score,left,right)
+  if best is None:continue
+  _,left,right=best
+  local_start=begin+sum(len(line) for line in lines[:left])
+  # A single over-long line is truncated, never skipped.
+  local_end=min(stop,local_start+min(sum(len(line) for line in lines[left:right+1]),2400))
+  if local_end<=local_start:local_end=min(stop,local_start+2400)
+  return local_start,local_end
+ raise ValueError('no eligible lexical passage')
+
+
 def semantic_span(query,text,allowed_ranges=None):
  # Original Unicode spans only. Local CPU similarity selects a passage, no model-generated quote.
  ranges=allowed_ranges if allowed_ranges is not None else[(0,len(text))]
@@ -125,10 +163,8 @@ def search(query: str, *, manifest: Path, receipts: Path, limit=5, require_curre
    try:local_start,local_end=semantic_span(query,text,allowed_ranges=ranges)
    except ValueError:continue
   else:
-   begin,stop=max(ranges,key=lambda span:sum(t in text[span[0]:span[1]].casefold()for t in terms))
-   lines=text[begin:stop].splitlines(keepends=True);weights=[sum(t in l.casefold()for t in terms)for l in lines]
-   center=max(range(len(lines)),key=lambda i:weights[i])if lines else 0
-   local_start=begin+sum(len(line)for line in lines[:max(0,center-3)]);local_end=min(stop,local_start+2400)
+   try:local_start,local_end=lexical_span(text,ranges,terms)
+   except ValueError:continue
   excerpt=text[local_start:local_end];start=text[:local_start].count('\n')
   if not excerpt:continue
   quote_start=record.get('char_start',0)+local_start;quote_end=quote_start+len(excerpt)
