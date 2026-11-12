@@ -326,8 +326,17 @@ class BriefingDaemonTests(unittest.TestCase):
         ctx=context(event());raw=json.loads(answer())
         raw['interest']='Ausschreibungen'
         raw['evidence']['interest']=raw['evidence']['conversation_context']
+        # Our own SENT mail can never evidence the counterparty's interest. The
+        # claim is dropped with a visible caveat; the briefing continues on the
+        # evidenced conversation focus instead of failing as a whole.
+        result=b.validate_output(json.dumps(raw),ctx,starts_at=NOW)
+        self.assertNotIn('Konkretes Interesse:',result)
+        self.assertIn('Gesprächsfokus',result)
+        self.assertIn('Das konkrete Interesse der Gegenpartei ist nicht belegt',result)
+        raw['conversation_context']=None
         with self.assertRaises(b.ReviewRequired):
             b.validate_output(json.dumps(raw),ctx,starts_at=NOW)
+        raw['conversation_context']='Ausschreibungen'
         quote='Wir interessieren uns für Ausschreibungen.'
         ctx['messages'].append(dict(message_id='incoming-interest',internal_date='200',
             original=quote,labels=['INBOX'],account=b.CODE,author='external@example.org',

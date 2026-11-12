@@ -27,14 +27,18 @@ def timestamp(raw):
     return value.astimezone(timezone.utc)
 
 
-def due_briefing(event, *, calendar_id, category, now, max_delay_seconds=None):
+def due_briefing(event, *, calendar_id, category, now, max_delay_seconds=None, lead_minutes=15):
     """None is not due/out of scope; missed deadlines remain explicit results.
 
     category must come from a trusted project/CRM match, never a guess from a
     person's name. Identity depends on the real start, not RSVP/etag changes.
+    lead_minutes moves the whole preparation window earlier; identity stays
+    bound to the real start, so an earlier lead never duplicates a briefing.
     """
     if category not in ('acribic', 'stealth'):
         return None
+    if not isinstance(lead_minutes, int) or isinstance(lead_minutes, bool) or not 5 <= lead_minutes <= 240:
+        raise ValueError('briefing_lead_out_of_range')
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError('Explicit clock timezone required')
     if event.get('status') == 'cancelled' or 'dateTime' not in event.get('start', {}):
@@ -44,7 +48,7 @@ def due_briefing(event, *, calendar_id, category, now, max_delay_seconds=None):
     if not event.get('id') or not calendar_id:
         raise ValueError('Real calendar and event identity required')
     starts = timestamp(event['start']['dateTime']); clock = now.astimezone(timezone.utc)
-    due = starts - timedelta(minutes=15)
+    due = starts - timedelta(minutes=lead_minutes)
     if clock < due or clock >= starts:
         return None
     delay = int((clock - due).total_seconds())

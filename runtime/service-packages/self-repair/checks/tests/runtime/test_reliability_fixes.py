@@ -178,5 +178,59 @@ class AbstainDeliveryTests(unittest.TestCase):
         self.assertIn('Konkrete Lücke:', runtime.sent[0])
 
 
+class BriefingLeadTests(unittest.TestCase):
+    def test_default_window_unchanged_and_longer_lead_opens_earlier(self):
+        later = event(start={'dateTime': (NOW + dt.timedelta(minutes=30)).isoformat()})
+        self.assertIsNone(b.due_briefing(later, calendar_id=CODE, category='acribic', now=NOW))
+        due = b.due_briefing(later, calendar_id=CODE, category='acribic', now=NOW, lead_minutes=45)
+        self.assertIsNotNone(due)
+        # Identity stays bound to the real start: same key in both windows.
+        at_15 = event()
+        due_default = b.due_briefing(at_15, calendar_id=CODE, category='acribic', now=NOW)
+        due_early = b.due_briefing(at_15, calendar_id=CODE, category='acribic', now=NOW, lead_minutes=45)
+        self.assertEqual(due_default.identity, due_early.identity)
+
+    def test_lead_validation(self):
+        for bad in (0, 4, 241, True, '45'):
+            with self.subTest(lead=bad), self.assertRaises(ValueError):
+                b.due_briefing(event(), calendar_id=CODE, category='acribic', now=NOW, lead_minutes=bad)
+
+    def test_tick_delivers_inside_extended_window_only_with_lead(self):
+        later = event(start={'dateTime': (NOW + dt.timedelta(minutes=30)).isoformat()})
+
+        class Reads:
+            def events(self, now):
+                return [later]
+
+            def current_event(self, id):
+                return later
+
+            def context(self, e, category):
+                return base_context(e)
+
+        class Runtime:
+            def __init__(self, store):
+                self.store, self.sent = store, []
+
+            def model(self, ctx):
+                return json.dumps(dict(abstain=True, reason='kein Beleg'))
+
+            def send(self, identity, message):
+                self.sent.append(message)
+                self.store.step(identity, 'delivered', receipt='fictional-receipt')
+                return self.store.get(identity)
+
+        for lead, expected in ((15, 0), (45, 1)):
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            store = b.Store(Path(tmp.name) / 'state')
+            runtime = Runtime(store)
+            with patch.object(b.dt, 'datetime', wraps=dt.datetime) as clock:
+                clock.now.return_value = NOW
+                report = b.tick(Reads(), store, runtime, now=NOW, activate=True, lead_minutes=lead)
+            self.assertEqual(len(runtime.sent), expected, lead)
+
+
+
 if __name__ == '__main__':
     unittest.main()

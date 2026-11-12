@@ -910,7 +910,7 @@ class Runtime:
         return self.store.recover_send(identity)
 
 
-def same_current(reads, original, due, *, trusted_tags, now=None):
+def same_current(reads, original, due, *, trusted_tags, now=None, lead_minutes=15):
     fresh = reads.current_event(due.event_id)
     category, _ = classify(fresh, trusted_tags=trusted_tags)
     if category is None and hasattr(reads,'business_mapping'):
@@ -920,7 +920,7 @@ def same_current(reads, original, due, *, trusted_tags, now=None):
     if (category != due.category or event_calendar(fresh)!=due.calendar_id or
             any(fresh.get(k)!=original.get(k) for k in meaningful) or external_attendees(fresh)!=external_attendees(original)):
         raise ReviewRequired('calendar_changed_review_required')
-    if due_briefing(fresh, calendar_id=event_calendar(fresh), category=category, now=now or dt.datetime.now(dt.timezone.utc)) is None:
+    if due_briefing(fresh, calendar_id=event_calendar(fresh), category=category, now=now or dt.datetime.now(dt.timezone.utc), lead_minutes=lead_minutes) is None:
         raise ReviewRequired('event_no_longer_due')
     return fresh
 
@@ -967,7 +967,7 @@ def incomplete_notice(event, due, context=None, *, gap=None):
             'Sag mir Bescheid, wenn der Call durch ist.')
 
 
-def tick(reads, store, runtime, *, now, activate=False, trusted_tags=False, max_tasks=2):
+def tick(reads, store, runtime, *, now, activate=False, trusted_tags=False, max_tasks=2, lead_minutes=15):
     events=sorted(reads.events(now),key=lambda e:classify(e,trusted_tags=trusted_tags)[0] is None)
     report=dict(due=0,claimed=0,model_jobs=0,delivered=0,incomplete_notices=0,review=0,deferred=0,recovered=0,dry_run=not activate)
     tick_started=time.monotonic()
@@ -982,7 +982,7 @@ def tick(reads, store, runtime, *, now, activate=False, trusted_tags=False, max_
                 report['review']+=1;continue
         if category is None:
             report['review']+=1;continue
-        due=due_briefing(event,calendar_id=event_calendar(event),category=category,now=current_time())
+        due=due_briefing(event,calendar_id=event_calendar(event),category=category,now=current_time(),lead_minutes=lead_minutes)
         if due is None:continue
         if isinstance(due,dict):report['review']+=1;continue
         report['due']+=1
@@ -1007,7 +1007,7 @@ def tick(reads, store, runtime, *, now, activate=False, trusted_tags=False, max_
             else:report['recovered']+=1
             stage='read_sources';context=None
             try:
-                fresh=same_current(reads,event,due,trusted_tags=trusted_tags,now=current_time())
+                fresh=same_current(reads,event,due,trusted_tags=trusted_tags,now=current_time(),lead_minutes=lead_minutes)
                 if existing['model_attempted']:
                     context_path=store.root/(due.identity+'.context.json')
                     model_path=store.root/(due.identity+'.model.json')
@@ -1015,10 +1015,10 @@ def tick(reads, store, runtime, *, now, activate=False, trusted_tags=False, max_
                         raise ReviewRequired('attempted_model_result_unavailable_no_replay')
                     context=json.loads(context_path.read_text());output=json.loads(model_path.read_text())
                     if context.get('briefing_job_id')!=due.identity:raise ReviewRequired('recovered_context_identity_mismatch')
-                    same_current(reads,context['calendar'],due,trusted_tags=trusted_tags,now=current_time())
+                    same_current(reads,context['calendar'],due,trusted_tags=trusted_tags,now=current_time(),lead_minutes=lead_minutes)
                 else:
                     context=reads.context(fresh,due.category)
-                    same_current(reads,fresh,due,trusted_tags=trusted_tags,now=current_time())
+                    same_current(reads,fresh,due,trusted_tags=trusted_tags,now=current_time(),lead_minutes=lead_minutes)
                     context['briefing_job_id']=due.identity
                     store.step(due.identity,'model_attempted',model=True)
                     report['model_jobs']+=1;stage='model'
@@ -1026,7 +1026,7 @@ def tick(reads, store, runtime, *, now, activate=False, trusted_tags=False, max_
                 stage='validate'
                 message=validate_output(output,context,starts_at=due.starts_at)
                 stage='calendar_recheck'
-                same_current(reads,fresh,due,trusted_tags=trusted_tags,now=current_time())
+                same_current(reads,fresh,due,trusted_tags=trusted_tags,now=current_time(),lead_minutes=lead_minutes)
                 stage='delivery'
                 store.step(due.identity,'send_attempted',sending=True)
                 result=runtime.send(due.identity,message)
@@ -1043,7 +1043,7 @@ def tick(reads, store, runtime, *, now, activate=False, trusted_tags=False, max_
                 else:
                     store.step(due.identity,'review_required_no_replay')
                     try:
-                        fresh=same_current(reads,event,due,trusted_tags=trusted_tags,now=current_time())
+                        fresh=same_current(reads,event,due,trusted_tags=trusted_tags,now=current_time(),lead_minutes=lead_minutes)
                         store.step(due.identity,'send_attempted',sending=True,delivery_kind='incomplete_notice')
                         result=runtime.send(due.identity,incomplete_notice(fresh,due,context,gap=notice_gap(error)))
                         if result and result['state']=='delivered':report['incomplete_notices']+=1
@@ -1060,6 +1060,11 @@ def main():
     parser.add_argument('--once', action='store_true')
     parser.add_argument('--permissions')
     parser.add_argument('--state', default='/home/hermes/.hermes/gtm/briefings')
+    parser.add_argument('--lead-minutes', type=int, default=15,
+                        help='Start preparation this many minutes before the call (default 15). '
+                             'A larger lead runs the same one-shot pipeline earlier, leaving room '
+                             'for the existing repair path before the call; the briefing simply '
+                             'arrives earlier. Identity stays bound to the real event start.')
     args = parser.parse_args()
     if args.worker:
         native_worker()
@@ -1078,7 +1083,8 @@ def main():
     while True:
         try:
             result = tick(reads, store, runtime, now=dt.datetime.now(dt.timezone.utc), activate=args.activate,
-                          trusted_tags=permission.get('trusted_project_tags') is True)
+                          trusted_tags=permission.get('trusted_project_tags') is True,
+                          lead_minutes=args.lead_minutes)
             print(json.dumps(result), flush=True)
         except Exception:
             print(json.dumps({'abstain': True, 'reason': 'briefing_pass_unavailable', 'model_jobs': None, 'outcome_unknown': True}), flush=True)
