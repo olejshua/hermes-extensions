@@ -16,7 +16,7 @@ CORE = Path('/home/hermes/.hermes/hermes-agent')
 sys.path.insert(0, str(CORE))
 import hermes_bootstrap  # Select the reviewed committed native dependencies.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from mail_workflow import UNDERSTAND, COMPOSE
+from mail_workflow import UNDERSTAND, COMPOSE, effort_for_phase
 from mail_outcomes import REVIEW
 from mail_model_status import safe_failure
 
@@ -65,7 +65,7 @@ def main():
         with allowed_auxiliary_providers({'openai-codex'}), contextlib.redirect_stdout(sys.stderr):
             agent = AIAgent(model='gpt-6.1-sol', provider='openai-codex', api_mode='codex_responses',
                             api_key=runtime['api_key'], base_url=runtime['base_url'],
-                            reasoning_config={'effort': 'high'}, max_tokens=6000,
+                            reasoning_config={'effort': effort_for_phase(packet['phase'], packet.get('effort'))}, max_tokens=6000,
                             enabled_toolsets=[], max_iterations=2, quiet_mode=True,
                             save_trajectories=False, skip_memory=True, skip_context_files=True,
                             load_soul_identity=False, skip_background_review=True, side_agent=True,

@@ -696,6 +696,7 @@ def validate_output(raw, context, *, starts_at):
     if value.get('company'):required.append('company')
     if value.get('role'):required.append('role')
     interest_label='Konkretes Interesse'
+    dropped_interest=False
     for field in required:
         bound=refs(field)
         if field in ('person','company','role') and value.get(field):
@@ -721,6 +722,16 @@ def validate_output(raw, context, *, starts_at):
                 except (KeyError,ValueError,TypeError):continue
                 if known_at.tzinfo is not None and known_at<=starts_at:history.append(doc)
             if not context.get('crm',{}).get('available') or not history:
+                # Field-tolerant like role/company above: an interest claim whose
+                # only evidence is not a counterparty original is dropped, never
+                # smoothed over. The briefing continues on the evidenced
+                # conversation_context, visibly caveated below. With no evidenced
+                # focus at all there is still nothing reliable to deliver.
+                if value.get('conversation_context'):
+                    value['interest']=None
+                    dropped_interest=True
+                    bound=refs('conversation_context')
+                    continue
                 raise ReviewRequired('interest_requires_counterparty_original')
             interest_label='Bisheriger Gesprächsstand laut CRM'
     actual_address=latest_own_addressing(list(messages.values()),person_email)
@@ -740,6 +751,7 @@ def validate_output(raw, context, *, starts_at):
     if any(marker in json.dumps(value,ensure_ascii=False) for marker in ('MEDIA:','attachment://','\x00')):
         raise ReviewRequired('unsupported_delivery_markup')
     caveats=[value['caveat']] if value.get('caveat') else []
+    if dropped_interest:caveats.append('Das konkrete Interesse der Gegenpartei ist nicht belegt; der Gesprächsfokus stammt aus den belegten eigenen und Projekt-Quellen.')
     if not value.get('company'):caveats.append('Der ausgeschriebene Firmenname ist noch nicht belegt.')
     if context.get('source_gaps'):caveats.append('Einzelne Zusatzquellen fehlen; die genannten Fakten stammen aus den vorhandenen Originalen.')
     from zoneinfo import ZoneInfo
@@ -913,7 +925,27 @@ def same_current(reads, original, due, *, trusted_tags, now=None):
     return fresh
 
 
-def incomplete_notice(event, due, context=None):
+# Known validation gaps translated for the partial notice. Only these fixed
+# codes are ever named; arbitrary exception text can contain sensitive detail.
+NOTICE_GAPS = {
+    'briefing_abstained': 'Die Personen- oder Gesprächszuordnung ist aus den Originalen nicht belegt.',
+    'interest_requires_counterparty_original': 'Das konkrete Interesse und ein eigener Gesprächsfokus sind nicht belegt.',
+    'named_fact_not_in_original': 'Ein genannter Name oder Fakt ist im Original nicht belegt.',
+    'missing_original_evidence': 'Eine nötige Originalstelle als Beleg fehlt.',
+    'incomplete_thread_sources': 'Der Mailverlauf ist unvollständig.',
+    'calendar_changed_review_required': 'Der Termin hat sich während der Prüfung geändert.',
+    'worker_failed_no_replay': 'Die Auswertung ist technisch fehlgeschlagen und wurde nicht wiederholt.',
+}
+
+
+def notice_gap(error):
+    """Map a ReviewRequired code to its fixed German gap line, never raw text."""
+    if isinstance(error, ReviewRequired) and error.args and isinstance(error.args[0], str):
+        return NOTICE_GAPS.get(error.args[0])
+    return None
+
+
+def incomplete_notice(event, due, context=None, *, gap=None):
     """A source-limited preparation keeps actual useful facts and exact gaps."""
     from zoneinfo import ZoneInfo
     at = due.starts_at.astimezone(ZoneInfo('Europe/Berlin')).strftime('%H:%M Uhr')
@@ -930,7 +962,8 @@ def incomplete_notice(event, due, context=None):
             '**Belegt:** '+'; '.join(facts)+'.\n\n'
             '**Im Gespräch klären:** Welcher konkrete nächste Schritt ist für beide Seiten sinnvoll, und was fehlt dafür?\n\n'
             '**Offen:** Die inhaltliche Auswertung der weiteren Originalquellen ist noch nicht verifiziert; '
-            'konkretes Interesse und Zusagen sind daraus noch nicht sicher ableitbar.\n\n'
+            'konkretes Interesse und Zusagen sind daraus noch nicht sicher ableitbar.'
+            + (f' Konkrete Lücke: {gap}' if gap in NOTICE_GAPS.values() else '') + '\n\n'
             'Sag mir Bescheid, wenn der Call durch ist.')
 
 
@@ -1012,7 +1045,7 @@ def tick(reads, store, runtime, *, now, activate=False, trusted_tags=False, max_
                     try:
                         fresh=same_current(reads,event,due,trusted_tags=trusted_tags,now=current_time())
                         store.step(due.identity,'send_attempted',sending=True,delivery_kind='incomplete_notice')
-                        result=runtime.send(due.identity,incomplete_notice(fresh,due,context))
+                        result=runtime.send(due.identity,incomplete_notice(fresh,due,context,gap=notice_gap(error)))
                         if result and result['state']=='delivered':report['incomplete_notices']+=1
                     except Exception:
                         if store.get(due.identity)['send_attempted']:store.recover_send(due.identity)
