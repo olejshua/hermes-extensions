@@ -64,7 +64,9 @@ class Incidents:
                 prior=c.execute('SELECT 1 FROM repair_incidents WHERE signature=?',(base,)).fetchone()
             sig=queued['signature']if queued else hash_value([base,source_key])if prior else base
             private_json(path,snapshot)
-            job=self.lifecycle.enqueue_job(idempotency_key='repair:'+sig,job_kind='hermes_repair',max_attempts=2)
+            # Retries are evidence-gated at dispatch (distinct retry_key per attempt),
+            # so the lifecycle budget is a backstop, not the two-attempt cap.
+            job=self.lifecycle.enqueue_job(idempotency_key='repair:'+sig,job_kind='hermes_repair',max_attempts=20)
             with self.lifecycle.connect()as c:
                 c.execute('BEGIN IMMEDIATE')
                 c.execute('''INSERT OR IGNORE INTO repair_incidents

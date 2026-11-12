@@ -24,6 +24,12 @@ from gtm import briefing_daemon as b  # noqa: E402
 from gtm.calendar.routing import CODE  # noqa: E402
 from mail_workflow import effort_for_phase  # noqa: E402
 
+BRAIN = REPO / 'runtime/service-packages/brain/src'
+REPAIR = REPO / 'runtime/service-packages/self-repair'
+for entry in (str(BRAIN), str(REPAIR)):
+    if entry not in sys.path:
+        sys.path.insert(0, entry)
+
 
 def load(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
@@ -275,6 +281,43 @@ class DialogueStyleTests(unittest.TestCase):
         self.assertIn('konkreter Freigabe', policy.ROLE)
         self.assertIn('Keine Emojis', policy.ROLE)
 
+
+
+class SelfRepairRetryTests(unittest.TestCase):
+    """Retries are evidence-gated, not capped at a fixed two attempts."""
+
+    def setUp(self):
+        from self_repair.store import Incidents
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.incidents = Incidents(self.tmp.name)
+        recorded = self.incidents.record(source_key='case-1', component='mail',
+                                         code='reply_result_missing',
+                                         versions={'v': 1}, snapshot={'case': {}})
+        self.job_id = recorded['job']['job_id']
+        self.guard = self.incidents.guard
+
+    def test_no_fixed_two_attempt_cap_and_no_identical_repeats(self):
+        self.assertEqual(self.incidents.get(self.incidents.record(
+            source_key='case-1', component='mail', code='reply_result_missing',
+            versions={'v': 1}, snapshot={'case': {}})['signature'])['job']['max_attempts'], 20)
+        self.assertTrue(self.guard.reserve(self.job_id, 'build:1', seconds=60, retry_key='initial')['allowed'])
+        self.guard.finish(self.job_id, 'build:1', 'failed')
+        self.assertTrue(self.guard.reserve(self.job_id, 'build:2', seconds=60, retry_key='evidence-a')['allowed'])
+        self.guard.finish(self.job_id, 'build:2', 'failed')
+        # The third attempt was previously rejected as cause_attempts_exhausted.
+        third = self.guard.reserve(self.job_id, 'build:3', seconds=60, retry_key='evidence-b')
+        self.assertTrue(third['allowed'], third)
+        self.guard.finish(self.job_id, 'build:3', 'failed')
+        # Identical evidence never buys another attempt.
+        repeat = self.guard.reserve(self.job_id, 'build:4', seconds=60, retry_key='evidence-b')
+        self.assertFalse(repeat['allowed'])
+        self.assertEqual(repeat['code'], 'same_feedback_already_tried')
+
+    def test_guard_source_has_no_fixed_cause_cap(self):
+        source = (REPAIR / 'self_repair/guard.py').read_text()
+        self.assertNotIn('cause_attempts_exhausted', source)
+        self.assertIn('same_feedback_already_tried', source)
 
 
 if __name__ == '__main__':

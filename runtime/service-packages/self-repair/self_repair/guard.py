@@ -46,12 +46,11 @@ class RepairGuard:
             if prior and prior['job_id']!=job_id and prior['outcome']!='passed':return no('same_cause_paused')
             if retry_key!='initial' and c.execute('SELECT 1 FROM repair_dispatches WHERE cause=? AND retry_key=?',(cause,retry_key)).fetchone():
                 return no('same_feedback_already_tried')
-            family=c.execute('SELECT outcome FROM repair_dispatches WHERE cause=? ORDER BY started DESC,rowid DESC',(cause,)).fetchall()
-            unresolved=0
-            for row in family:
-                if row['outcome']=='passed':break
-                unresolved+=1
-            if unresolved>=2:return no('cause_attempts_exhausted')
+            # No fixed attempt cap per cause: every retry must already carry a
+            # distinct retry_key (new provider progress, new review/gate
+            # feedback or a resume generation), and identical evidence is
+            # rejected above as same_feedback_already_tried. The 24h model-time
+            # budget and the circuit cooldown below still bound total work.
             recent=c.execute("SELECT finished,outcome FROM repair_dispatches WHERE phase LIKE 'build:%' AND outcome IN ('passed','failed') ORDER BY finished DESC,rowid DESC LIMIT 3").fetchall()
             if phase.startswith('build:')and len(recent)==3 and all(r['outcome']=='failed' for r in recent):
                 until=recent[0]['finished']+COOLDOWN_SECONDS
