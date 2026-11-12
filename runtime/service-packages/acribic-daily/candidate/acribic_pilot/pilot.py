@@ -409,3 +409,141 @@ class Pilot:
                         f"{len(confirmed-committed)} CRM-Abschlüsse offen; {delivery_text}.")
         atomic(self.run/'result.json',answer)
         return answer
+
+    def _attempt_record(self,events,address):
+        found=[e for e in events if e.get('event')=='attempt'and self.closure.mailbox(e.get('email'))==address]
+        if len(found)!=1:raise Stop('resolve_requires_exactly_one_attempt_record')
+        return found[0]
+
+    def _sent_proof(self,mail,address):
+        """Read-only Gmail Sent proof: exactly one message, else nothing changes."""
+        subject=mail['subject']
+        if any(c in subject for c in ('"','\r','\n')):raise Stop('subject_cannot_form_safe_query')
+        result=self.sender.fetch(self.gmail,f'in:sent to:{address} subject:"{subject}"',100)
+        if result.get('nextPageToken'):raise Stop('sent_search_incomplete_no_resolution')
+        found={}
+        for message in result['messages']:
+            try:
+                mid=self.sender.message_id(message);self.sender.verify_sent(message,mid,mail)
+            except ValueError:continue
+            found[mid]=message
+        if len(found)>1:raise Stop('ambiguous_sent_matches_resolve_nothing')
+        if not found:return None
+        mid,message=next(iter(found.items()))
+        return {'message_id':mid,'sender':self.sender.single_address(message['sender']),
+                'to':self.sender.single_address(message['to']),'subject':message['subject'],'labels':message['labelIds']}
+
+    def resolve(self,email):
+        """Safely resolve one unclear send (aborted attempt/lost ACK); never sends.
+
+        An interrupted attempt deliberately blocks the whole campaign (no blind
+        retry). Resolution is allowed only with exact, unique, read-only Gmail
+        Sent evidence for the prepared sender/recipient/subject. The central
+        account journal is reconciled first, the run journal second - the live
+        write order. Zero or ambiguous matches, conflicting message IDs or any
+        schema break resolve nothing and leave every reservation untouched.
+        No CRM write happens here; the existing completion owns that step.
+        """
+        address=self.closure.mailbox(email)
+        with self.central.lock():
+            # No OTHER unresolved send may exist. Proven-sent mails awaiting
+            # their CRM commit (sent_readback/crm_*) are a normal halted-run
+            # state and never block evidence recovery; halt/bounce events gate
+            # the completion step, not the read-only proof gathered here.
+            for key,event in self.central.states().items():
+                if key!=(self.run_id,address) and event['kind'] in ('attempt','send_ack'):
+                    raise Stop('other_unresolved_attempt_blocks_resolution')
+            ready,mails,batch=self.load_ready()
+            matching=[m for m in mails if self.closure.mailbox(m['to'])==address]
+            if len(matching)!=1:raise Stop('resolve_requires_exactly_one_prepared_recipient')
+            mail=matching[0]
+            segment=next(s for s in self.segments(mails,batch)if s['liste']==mail['liste'])
+            journal=segment['journal']
+            events=self.closure.read_journal(journal)if journal.exists()else[]
+            state=self.closure.validate(segment['mails'],segment['batch'],events,len(segment['mails']),segment['liste'],details=True)
+            if address not in state['uncertain']:raise Stop('recipient_is_not_uncertain')
+            attempt=self._attempt_record(events,address)
+            journal_acks=[e for e in events if e.get('event')=='send_ack'and self.closure.mailbox(e.get('email'))==address]
+            central=self.central.states().get((self.run_id,address))
+            if central is None or central['kind']not in ('attempt','send_ack','sent_readback'):
+                raise Stop('central_state_not_resolvable')
+            known_ids=[e['message_id']for e in journal_acks]
+            known_ids+= [e['payload']['message_id']for e in self.central.events()
+                         if e['run_id']==self.run_id and e['mailbox']==address
+                         and e['kind']in ('send_ack','sent_readback') and e['payload'].get('message_id')]
+            proof=self._sent_proof(mail,address)
+            if proof is None:
+                return {'state':'unresolved','email':address,'reason':'no_unique_sent_evidence',
+                        'sent':0,'note':'attempt stays reserved; never retry blindly'}
+            if any(known!=proof['message_id']for known in known_ids):
+                raise Stop('recorded_ack_conflicts_with_sent_evidence')
+            child=segment['batch']
+            common={'schema_version':1,'batch_id':child['batch_id'],'batch_sha256':self.closure.fingerprint(child),
+                    'page_id':self.closure.page_id(mail['page_id']),'email':address,
+                    'content_sha256':self.closure.fingerprint(self.closure.content(mail)),
+                    'attempt_id':attempt['attempt_id'],'request_sha256':fingerprint(self.request(mail))}
+            def stamp(kind,**fields):
+                return {**common,'at':datetime.now(timezone.utc).isoformat(),'event':kind,**fields}
+            def central_args(payload):
+                return dict(run_id=self.run_id,mailbox=mail['to'],org_domain=mail['org_domain'],
+                            source_id=mail['page_id'],payload=payload)
+            if not journal_acks and central['kind']=='attempt':
+                # True lost ACK: the API outcome never reached either journal.
+                ack=stamp('send_ack_recovered',message_id=proof['message_id'],sender=proof['sender'],
+                          to=proof['to'],subject=proof['subject'],labels=proof['labels'],
+                          unique_match_count=1,evidence_source='gmail_sent_read_only',recovery_reason='lost_ack')
+                self.central.append('send_ack',**central_args(ack))
+                self.sender.append_event(journal,ack)
+            elif not journal_acks:
+                # Central recorded the ACK; the crash hit before the run journal.
+                ack=stamp('send_ack',message_id=proof['message_id'])
+                self.sender.append_event(journal,ack)
+            readback=stamp('sent_readback',message_id=proof['message_id'],sender=proof['sender'],
+                           to=proof['to'],subject=proof['subject'],labels=proof['labels'])
+            if central['kind']!='sent_readback':
+                self.central.append('sent_readback',**central_args(readback))
+            if not any(e.get('event')=='sent_readback'and self.closure.mailbox(e.get('email'))==address for e in events):
+                self.sender.append_event(journal,readback)
+            after=self.closure.validate(segment['mails'],segment['batch'],self.closure.read_journal(journal),
+                                        len(segment['mails']),segment['liste'],details=True)
+            if address not in after['confirmed']:raise Stop('resolution_did_not_confirm')
+            if self.central.states()[(self.run_id,address)]['kind']!='sent_readback':
+                raise Stop('central_resolution_did_not_confirm')
+            return {'state':'resolved','email':address,'message_id':proof['message_id'],'sent':0,
+                    'note':'send evidence recovered read-only; CRM completion remains a separate step'}
+
+    def complete_open(self):
+        """Run the existing fail-closed CRM completion for proven-sent mails whose
+        CRM commit is still open. Never sends. Refuses while any send attempt is
+        unresolved or any halt/bounce stands; unclear recipients stay untouched.
+        """
+        with self.central.lock():
+            ready,mails,batch=self.load_ready()
+            status,events=self.statuses(mails,batch)
+            if status['uncertain']:raise Stop('resolve_uncertain_sends_first')
+            if any(e['run_id']==self.run_id and e['kind']in('bounce','run_halted')for e in self.central.events()):
+                raise Stop('halted_run_not_completable')
+            if self.bounce_check is not None and events:
+                bounce=self.bounce_check(events)
+                if bounce.get('confirmed')or bounce.get('uncertain'):
+                    raise Stop('bounce_or_uncertain_delivery_report')
+            states=self.central.states();completed=[]
+            for mail in mails:
+                address=mail['to'].strip().casefold()
+                if address not in status['confirmed']:continue
+                state=states.get((self.run_id,address))
+                if state and state['kind']=='crm_committed':continue
+                segment=next(s for s in self.segments(mails,batch)if s['liste']==mail['liste'])
+                self.scope(segment['liste'])
+                self.v.MAILS=str(segment['folder']/'mails.json');self.v.BATCH=str(segment['folder']/'batch.json')
+                self.central.append('crm_attempt',run_id=self.run_id,mailbox=mail['to'],
+                                    org_domain=mail['org_domain'],source_id=mail['page_id'])
+                result=self.closure.complete(self.v,segment['journal'],len(segment['mails']),probe=False)
+                if address not in set(result['confirmed'])|set(result['already_committed']):
+                    raise Stop('CRM_completion_missing')
+                self.central.append('crm_readback',run_id=self.run_id,mailbox=mail['to'],
+                                    org_domain=mail['org_domain'],source_id=mail['page_id'])
+                self.central.append('crm_committed',run_id=self.run_id,mailbox=mail['to'],
+                                    org_domain=mail['org_domain'],source_id=mail['page_id'])
+                completed.append(address)
+            return {'state':'open_confirmations_completed','completed':completed,'sent':0}

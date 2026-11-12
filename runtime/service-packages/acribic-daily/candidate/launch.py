@@ -150,8 +150,9 @@ def seed(root):
 
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--root',type=Path,required=True)
-    parser.add_argument('command',choices=['prepare','check','tick','status','result','guard','seed'])
+    parser.add_argument('command',choices=['prepare','check','tick','status','result','guard','seed','resolve','complete-open'])
     parser.add_argument('--slot',type=int)
+    parser.add_argument('--email')
     args=parser.parse_args();root=args.root.resolve()
     try:
         if args.command=='guard':answer=guard(root)
@@ -164,6 +165,13 @@ def main():
                 elif args.command=='tick':
                     if args.slot is None:raise Stop('explicit_slot_required')
                     pilot.gmail.allow_write=True;answer=pilot.tick(args.slot)
+                elif args.command=='resolve':
+                    # Read-only Gmail evidence; allow_write stays False.
+                    if not args.email:raise Stop('explicit_recipient_required')
+                    answer=pilot.resolve(args.email)
+                elif args.command=='complete-open':
+                    # CRM writes only, through the existing fail-closed closure.
+                    answer=pilot.complete_open()
                 elif args.command=='result':
                     _,mails,batch=pilot.load_ready();_,events=pilot.statuses(mails,batch)
                     atomic(pilot.run/'latest-bounce-check.json',pilot.bounce_check(events));answer=pilot.result()
