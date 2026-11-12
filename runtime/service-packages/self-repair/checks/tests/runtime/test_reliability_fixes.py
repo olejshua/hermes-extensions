@@ -429,6 +429,16 @@ class SearchSnippetTests(unittest.TestCase):
         self.assertIn('Example GmbH', excerpt)
         self.assertLessEqual(len(excerpt), 2400)
 
+    def test_keyword_stuffed_line_does_not_beat_distinct_terms(self):
+        # A term counts at most once per line: a line repeating one keyword
+        # many times must not outweigh the passage matching several distinct
+        # terms.
+        stuffed = 'Termin Termin Termin Termin Termin Termin.\n'
+        decisive = 'Die Terminabsage morgen ist bestätigt.\n'
+        text = stuffed + 'Zwischentext.\n' * 4 + decisive
+        start, end = self.span(text, [(0, len(text))], {'termin', 'morgen'})
+        self.assertIn('Terminabsage morgen', text[start:end])
+
     def test_excerpt_never_exceeds_character_bound(self):
         lines = ['Zeile %d mit Termin und Example GmbH.\n' % i for i in range(400)]
         text = ''.join(lines)

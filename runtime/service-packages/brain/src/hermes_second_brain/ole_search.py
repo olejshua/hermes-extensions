@@ -9,7 +9,9 @@ def _lexical_weights(lines,terms):
  # Token-prefix matching: German compounds keep their head noun, so
  # 'Terminabsage' still matches 'termin', while unrelated containment
  # ('Montag' matching 'tag') no longer inflates a line's weight.
- prefix=[sum(1 for word in re.findall(r'\w+',line.casefold()) for term in terms if word.startswith(term)) for line in lines]
+ # A term counts at most once per line: a keyword-stuffed but inconclusive
+ # line must not outweigh the passage that matches several distinct terms.
+ prefix=[sum(1 for term in terms if any(word.startswith(term) for word in re.findall(r'\w+',line.casefold()))) for line in lines]
  if any(prefix):return prefix
  # Suffix-only compounds would otherwise go dark; keep the old containment
  # reading as the fallback.
