@@ -10,18 +10,27 @@ from .ole_verify import version_checks
 from .state import _receipt
 
 GRANTS={'ole-approved':'approved-documents-2026-10-08','ole_unconfirmed':'remaining-vault-context-2026-10-08'}
+# Namespaces with their own verified approval pipeline. 'dreams' artifacts
+# carry publication receipts checked by dream_sync; this refresh must neither
+# fail on their missing export grants nor index them here. Any OTHER unknown,
+# missing or malformed namespace keeps the fail-closed behavior below: it is
+# not silently skipped, because skipping a grant-governed source by accident
+# would let its evidence go stale unnoticed.
+EXTERNAL_PIPELINES=frozenset({'dreams'})
 
 
 def grant_sources(manifest):
- # Sources outside the export-grant model (e.g. namespace 'dreams') carry
- # their own approval proof - publication receipts verified by dream_sync.
- # This refresh must neither fail on their missing export grants nor index
- # them here; their own verified pipeline owns them.
  return [source for source in manifest.sources if source.namespace in GRANTS]
 
 
 def grant_source_ids(manifest):
  return {source.id for source in grant_sources(manifest)}
+
+
+def check_namespaces(manifest):
+ for source in manifest.sources:
+  if source.namespace not in GRANTS and source.namespace not in EXTERNAL_PIPELINES:
+   raise RuntimeError('Source grant or export unavailable')
 
 
 def failure_result(exc):
@@ -39,6 +48,7 @@ def failure_result(exc):
 def snapshot(manifest,grants):
  active={g['id']for g in json.loads(Path(grants).read_text()).get('grants',[])if g.get('active')is True}
  packets={};records={};expected={}
+ check_namespaces(manifest)
  for source in grant_sources(manifest):
   if GRANTS.get(source.namespace)not in active or not source.root.is_dir()or not source.approval_receipts:raise RuntimeError('Source grant or export unavailable')
   packet=json.loads(source.approval_receipts.read_text());age=time.time()-packet['generated_at']

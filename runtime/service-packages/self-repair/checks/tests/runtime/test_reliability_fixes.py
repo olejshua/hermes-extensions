@@ -320,6 +320,62 @@ class SelfRepairRetryTests(unittest.TestCase):
         self.assertNotIn('cause_attempts_exhausted', source)
         self.assertIn('same_feedback_already_tried', source)
 
+    def test_backstops_still_effective(self):
+        # Circuit cooldown: three failed builds pause further builds.
+        for i in range(3):
+            phase = 'build:%d' % (i + 1)
+            self.assertTrue(self.guard.reserve(self.job_id, phase, seconds=60,
+                                               retry_key='evidence-%d' % i)['allowed'])
+            self.guard.finish(self.job_id, phase, 'failed')
+        blocked = self.guard.reserve(self.job_id, 'build:4', seconds=60, retry_key='evidence-d')
+        self.assertFalse(blocked['allowed'])
+        self.assertEqual(blocked['code'], 'repair_circuit_cooldown')
+        self.assertGreater(blocked['retry_at'], 0)
+
+    def test_model_time_budget_still_bounds_total_work(self):
+        other = self.incidents.record(source_key='case-2', component='mail',
+                                      code='mail_model_unavailable',
+                                      versions={'v': 2}, snapshot={'case': {}})
+        jid = other['job']['job_id']
+        # Reserve nearly the whole 2h window in one dispatch, then the next
+        # reservation must wait even with fresh evidence.
+        big = self.guard.reserve(jid, 'build:1', seconds=7140, retry_key='initial')
+        self.assertTrue(big['allowed'])
+        wait = self.guard.reserve(jid, 'build:2', seconds=120, retry_key='evidence-x')
+        self.assertFalse(wait['allowed'])
+        self.assertEqual(wait['code'], 'repair_time_budget_wait')
+
+    def test_same_cause_other_job_still_paused(self):
+        # An unresolved dispatch for the same cause on another job pauses new
+        # work on that cause; distinct retry evidence does not override this.
+        first = self.guard.reserve(self.job_id, 'build:1', seconds=60, retry_key='initial')
+        self.assertTrue(first['allowed'])
+        # Same cause (component+code), distinct incident job via new versions.
+        other = self.incidents.record(source_key='case-3', component='mail',
+                                      code='reply_result_missing',
+                                      versions={'v': 2}, snapshot={'case': {}})
+        self.assertNotEqual(other['job']['job_id'], self.job_id)
+        paused = self.guard.reserve(other['job']['job_id'], 'build:1', seconds=60, retry_key='initial')
+        self.assertFalse(paused['allowed'])
+        self.assertEqual(paused['code'], 'same_cause_paused')
+
+    def test_retry_evidence_requires_new_feedback(self):
+        from self_repair.service import retry_evidence, REFINE
+        import json as _json
+        directory = Path(self.tmp.name) / 'jobdir'
+        directory.mkdir(parents=True)
+        code = sorted(REFINE)[0]
+        incident = {'result': {'code': code}, 'job': {'error_type': None}}
+        self.assertIsNone(retry_evidence(incident, directory))
+        (directory / 'review-1.json').write_text(_json.dumps(
+            {'status': 'rejected', 'evidence': 'body not bound'}))
+        first = retry_evidence(incident, directory)
+        self.assertIsNotNone(first)
+        self.assertEqual(first, retry_evidence(incident, directory))
+        (directory / 'review-2.json').write_text(_json.dumps(
+            {'status': 'needs_input', 'evidence': 'which account?'}))
+        self.assertNotEqual(first, retry_evidence(incident, directory))
+
 
 class SearchSnippetTests(unittest.TestCase):
     """The lexical excerpt must show the decisive passage, not the loudest line."""
@@ -352,6 +408,33 @@ class SearchSnippetTests(unittest.TestCase):
         text = 'Das Ergebnis steht in Wochentagslogik verankert.\nMehr Text ohne Treffer.\n'
         start, end = self.span(text, [(0, len(text))], {'tag'})
         self.assertIn('Wochentagslogik', text[start:end])
+
+    def test_weekday_names_are_not_date_evidence(self):
+        # Compound false positive: 'Montag' must not count as evidence for 'tag'
+        # when a real match exists elsewhere in the file.
+        noise = ('Montag, Dienstag, Mittwoch, Donnerstag und Freitag sind Werktage.\n'
+                 'Am Montag beginnt die Woche, am Freitag endet sie.\n')
+        decisive = 'Der wichtigste Tag im Quartal ist der 20. November.\n'
+        text = noise + 'Zwischentext.\n' * 4 + decisive
+        start, end = self.span(text, [(0, len(text))], {'tag', 'quartal'})
+        self.assertIn('20. November', text[start:end])
+
+    def test_stronger_of_two_decisive_spans_wins_within_bound(self):
+        first = 'Der Termin findet statt.\n'
+        second = 'Der Termin mit Example GmbH am 20. November um 14 Uhr ist bestätigt.\n'
+        filler = 'Unauffälliger Fließtext ohne relevante Zeile.\n' * 6
+        text = first + filler + second + filler
+        start, end = self.span(text, [(0, len(text))], {'termin', 'example', 'november'})
+        excerpt = text[start:end]
+        self.assertIn('Example GmbH', excerpt)
+        self.assertLessEqual(len(excerpt), 2400)
+
+    def test_excerpt_never_exceeds_character_bound(self):
+        lines = ['Zeile %d mit Termin und Example GmbH.\n' % i for i in range(400)]
+        text = ''.join(lines)
+        start, end = self.span(text, [(0, len(text))], {'termin', 'example'})
+        self.assertLessEqual(end - start, 2400)
+        self.assertGreater(end - start, 0)
 
 
 class NativeRefreshNamespaceTests(unittest.TestCase):
@@ -396,6 +479,30 @@ class NativeRefreshNamespaceTests(unittest.TestCase):
     def test_grant_source_still_fails_closed_without_receipts(self):
         manifest, root = self._manifest([
             {'id': 'approved', 'root': '{root}/docs', 'namespace': 'ole-approved'},
+        ])
+        from hermes_second_brain.native_refresh import snapshot
+        with self.assertRaises(RuntimeError):
+            snapshot(manifest, root / 'grants.json')
+
+    def test_unknown_namespace_fails_closed(self):
+        # An arbitrary namespace must never be silently skipped: it could be a
+        # grant-governed source whose evidence would quietly go stale.
+        manifest, root = self._manifest([
+            {'id': 'approved', 'root': '{root}/docs', 'namespace': 'ole-approved',
+             'approval_receipts': '{root}/receipts.json'},
+            {'id': 'odd', 'root': '{root}/docs', 'namespace': 'bogus'},
+        ])
+        from hermes_second_brain.native_refresh import snapshot
+        with self.assertRaises(RuntimeError):
+            snapshot(manifest, root / 'grants.json')
+
+    def test_missing_namespace_fails_closed(self):
+        # load_manifest defaults the namespace to the source id, which is not a
+        # known grant namespace either.
+        manifest, root = self._manifest([
+            {'id': 'approved', 'root': '{root}/docs', 'namespace': 'ole-approved',
+             'approval_receipts': '{root}/receipts.json'},
+            {'id': 'unnamed', 'root': '{root}/docs'},
         ])
         from hermes_second_brain.native_refresh import snapshot
         with self.assertRaises(RuntimeError):
