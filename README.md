@@ -9,6 +9,8 @@ Custom source from a self-hosted Hermes Agent installation, captured on 2026-11-
 | Mail drafts, calendar reservations, call briefings and CRM | [Scripts](runtime/hermes-home/scripts/) and [GTM package](runtime/service-packages/gtm/) |
 | Outcome monitoring and bounded automated repair | [Observer](runtime/service-packages/reply-observer/) and [Repair](runtime/service-packages/self-repair/) |
 | Memory, retrieval, Dreaming and source refresh | [Second Brain](runtime/service-packages/brain/) |
+| Daily Acribic preparation and dispatch code | [Daily package](runtime/service-packages/acribic-daily/) |
+| Google Workspace helpers | [Workspace scripts](runtime/hermes-home/skills/productivity/google-workspace/scripts/) |
 
 The patch applies to [Nous Research Hermes Agent at 28e6496](https://github.com/NousResearch/hermes-agent/commit/28e6496a5e3adfea57bebfc9571b981bff378523). Apply it in a separate checkout of that revision with git apply --check and then git apply, using the absolute path to patches/hermes-agent.patch.
 
