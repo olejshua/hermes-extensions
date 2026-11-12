@@ -57,8 +57,11 @@ class GuardTests(unittest.TestCase):
         self.store.guard.finish(jid,'build:2','needs_review')
         d=self.store.dispatch(jid,'build:3',retry_key='new-countercase')
         self.assertFalse(d['allowed']);self.assertEqual(d['code'],'same_feedback_already_tried')
+        # The fixed two-attempt cause cap is gone: genuinely new evidence buys
+        # another attempt. The lifecycle max_attempts budget (20) plus circuit
+        # and model-time backstops bound the total instead.
         d=self.store.dispatch(jid,'build:3',retry_key='third-new-description')
-        self.assertFalse(d['allowed']);self.assertEqual(d['code'],'cause_attempts_exhausted')
+        self.assertTrue(d['allowed'])
     def test_three_failures_pause_repair_service_then_allow_one_half_open_trial(self):
         now=100000
         for n in range(3):
