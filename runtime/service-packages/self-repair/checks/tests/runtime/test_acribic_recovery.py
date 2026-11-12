@@ -88,13 +88,16 @@ class FakeV:
 
 
 class FakeGmail:
-    def __init__(self, messages):
-        self.messages = messages
-        self.allow_write = False
-
     def __call__(self, slug, data):
+        if slug == 'GMAIL_GET_PROFILE':
+            return {'emailAddress': self.profile}
         assert slug == 'GMAIL_FETCH_EMAILS', slug
         return {'messages': list(self.messages)}
+
+    def __init__(self, messages, profile=None):
+        self.messages = messages
+        self.allow_write = False
+        self.profile = closure.SENDER if profile is None else profile
 
     def normalized_body(self, value):
         return value
@@ -319,6 +322,57 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(self.v.pages[mail['page_id']]['properties']['Stage'], 'E-Mail raus')
         rows = [r for r in Path(self.v.NACHTRAG).read_text().splitlines() if r.strip()]
         self.assertEqual(len(rows), 10)
+
+
+    def test_partial_recovery_replay_is_idempotent(self):
+        # Crash shape: central recorded the recovery ACK, run journal did not.
+        mail = self.mails[7]
+        attempt_id = self.start_attempt(mail, mid=None, journal_ack=False, central_kind='attempt')
+        p = self.pilot([sent_message(mail, 'mid-7')])
+        first = p.resolve(mail['to'])
+        self.assertEqual(first['state'], 'resolved')
+        # A repeated resolve on the resolved mailbox must refuse, not duplicate.
+        with self.assertRaises(Stop):
+            self.pilot([sent_message(mail, 'mid-7')]).resolve(mail['to'])
+        kinds = [e['event'] for e in closure.read_journal(self.run / 'send.jsonl')]
+        self.assertEqual(kinds, ['attempt', 'send_ack_recovered', 'sent_readback'])
+
+    def test_wrong_gmail_account_never_resolves(self):
+        mail = self.mails[8]
+        self.start_attempt(mail, mid=None, journal_ack=False, central_kind='attempt')
+        before = (self.run / 'send.jsonl').read_bytes()
+        wrong = self.pilot([sent_message(mail, 'mid-8')])
+        wrong.gmail.profile = 'other@example.invalid'
+        with self.assertRaises(Stop):
+            wrong.resolve(mail['to'])
+        self.assertEqual((self.run / 'send.jsonl').read_bytes(), before)
+
+    def test_estimate_hint_of_more_pages_stops(self):
+        mail = self.mails[9]
+        self.start_attempt(mail, mid=None, journal_ack=False, central_kind='attempt')
+        before = (self.run / 'send.jsonl').read_bytes()
+        p = self.pilot([sent_message(mail, 'mid-9')])
+        original = p.gmail.messages
+        class EstimateGmail(FakeGmail):
+            def __call__(self, slug, data):
+                if slug == 'GMAIL_FETCH_EMAILS':
+                    return {'messages': list(self.messages), 'resultSizeEstimate': len(self.messages) + 5}
+                return super().__call__(slug, data)
+        p.gmail = EstimateGmail(original)
+        with self.assertRaises(Stop):
+            p.resolve(mail['to'])
+        self.assertEqual((self.run / 'send.jsonl').read_bytes(), before)
+
+    def test_standalone_sender_lock_blocks_resolution(self):
+        import fcntl
+        mail = self.mails[0]
+        self.start_attempt(mail, mid=None, journal_ack=False, central_kind='attempt')
+        before = (self.run / 'send.jsonl').read_bytes()
+        with open(self.v.SENDER_LOCK, 'a') as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaises(Stop):
+                self.pilot([sent_message(mail, 'mid-x')]).resolve(mail['to'])
+        self.assertEqual((self.run / 'send.jsonl').read_bytes(), before)
 
 
 if __name__ == '__main__':

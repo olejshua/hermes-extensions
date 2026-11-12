@@ -419,16 +419,30 @@ class Pilot:
         """Read-only Gmail Sent proof: exactly one message, else nothing changes."""
         subject=mail['subject']
         if any(c in subject for c in ('"','\r','\n')):raise Stop('subject_cannot_form_safe_query')
-        result=self.sender.fetch(self.gmail,f'in:sent to:{address} subject:"{subject}"',100)
-        if result.get('nextPageToken'):raise Stop('sent_search_incomplete_no_resolution')
-        found={}
-        for message in result['messages']:
-            try:
-                mid=self.sender.message_id(message);self.sender.verify_sent(message,mid,mail)
-            except ValueError:continue
-            found[mid]=message
-        if len(found)>1:raise Stop('ambiguous_sent_matches_resolve_nothing')
+        # Bind the proof to the exact sender account: a lookalike message in
+        # another account's Sent folder is not evidence for this send.
+        profile=self.gmail('GMAIL_GET_PROFILE',{})
+        if self.sender.single_address(profile.get('emailAddress'))!=self.closure.SENDER:
+            raise Stop('wrong_gmail_account_no_resolution')
+        query=f'in:sent to:{address} subject:"{subject}"'
+        def matches():
+            result=self.sender.fetch(self.gmail,query,100)
+            # Any hint of further pages makes a uniqueness claim impossible.
+            if result.get('nextPageToken')or result.get('resultSizeEstimate',0)>len(result['messages']):
+                raise Stop('sent_search_incomplete_no_resolution')
+            found={}
+            for message in result['messages']:
+                try:
+                    mid=self.sender.message_id(message);self.sender.verify_sent(message,mid,mail)
+                except ValueError:continue
+                found[mid]=message
+            if len(found)>1:raise Stop('ambiguous_sent_matches_resolve_nothing')
+            return found
+        found=matches()
         if not found:return None
+        # Stability: an independent second read must return the identical unique
+        # match before any journal is touched.
+        if matches()!=found:raise Stop('sent_evidence_changed_between_reads')
         mid,message=next(iter(found.items()))
         return {'message_id':mid,'sender':self.sender.single_address(message['sender']),
                 'to':self.sender.single_address(message['to']),'subject':message['subject'],'labels':message['labelIds']}
@@ -436,15 +450,33 @@ class Pilot:
     def resolve(self,email):
         """Safely resolve one unclear send (aborted attempt/lost ACK); never sends.
 
+        Gmail-side this is strictly read-only (profile + Sent searches), but it
+        MUTATES the durable journals: it appends recovery records to the
+        central account journal and the run journal. Those appends only move an
+        attempt from unclear to proven-sent; no send, draft or CRM write is
+        reachable from this path.
+
         An interrupted attempt deliberately blocks the whole campaign (no blind
         retry). Resolution is allowed only with exact, unique, read-only Gmail
-        Sent evidence for the prepared sender/recipient/subject. The central
-        account journal is reconciled first, the run journal second - the live
-        write order. Zero or ambiguous matches, conflicting message IDs or any
-        schema break resolve nothing and leave every reservation untouched.
-        No CRM write happens here; the existing completion owns that step.
+        Sent evidence for the prepared sender/recipient/subject, read twice
+        with identical results, from the verified sender account. The central
+        journal is reconciled first, the run journal second - the live write
+        order - and both locks are held, so a crash mid-recovery leaves a
+        prefix that a repeated resolve() call completes idempotently. Zero or
+        ambiguous matches, conflicting message IDs or any schema break resolve
+        nothing and leave every reservation untouched. No CRM write happens
+        here; the existing completion owns that step.
         """
         address=self.closure.mailbox(email)
+        lock_path=Path(self.v.SENDER_LOCK)
+        lock_path.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+        import fcntl
+        with lock_path.open('a')as sender_lock:
+            try:fcntl.flock(sender_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BlockingIOError:raise Stop('standalone_sender_active_no_resolution')from None
+            return self._resolve_locked(address,email)
+
+    def _resolve_locked(self,address,email):
         with self.central.lock():
             # No OTHER unresolved send may exist. Proven-sent mails awaiting
             # their CRM commit (sent_readback/crm_*) are a normal halted-run
@@ -516,7 +548,17 @@ class Pilot:
         """Run the existing fail-closed CRM completion for proven-sent mails whose
         CRM commit is still open. Never sends. Refuses while any send attempt is
         unresolved or any halt/bounce stands; unclear recipients stay untouched.
+
+        This writes real CRM state when executed on the host. Shipping this
+        code is not approval to run it: it executes only as an explicit,
+        separately approved operator action for a concrete run.
         """
+        # No SENDER_LOCK hold here: closure.complete self-locks per call, and a
+        # flock on a second description of the same file would deadlock against
+        # it. Concurrency protection comes from the central lock (native path)
+        # plus the completion's own lock; the standalone sender cannot run
+        # against a native attempt registry in the first place (its schema
+        # check fails closed before any send).
         with self.central.lock():
             ready,mails,batch=self.load_ready()
             status,events=self.statuses(mails,batch)
