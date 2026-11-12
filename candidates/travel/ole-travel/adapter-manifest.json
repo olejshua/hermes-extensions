@@ -1,0 +1,14 @@
+{
+  "schema": 2,
+  "files": {
+    "__init__.py": "f5d66983ccaacf8072c32c67908874fab8b4aa36b720ac2d623fe3ebcb24c11c",
+    "capture.py": "ae1a3ec70a237cf354e0da8ecfbe90b07298806829719d1b1468670b8956463a",
+    "contracts.py": "ebdff87b0f4bb9d375a44c91cb2507d687e6e0af918e27fefc81b02c612f50e8",
+    "official.py": "dec07714a6f5fc5d59ac546cba42f52c590a133bb90719db4f1c62849e91fb58",
+    "presentation.py": "9bf6c3c17307249411b2d81a6d1514e5459c0d04fa9c48cbc7313e71d93dc14b",
+    "service.py": "4780d5879e8a3e78efea872782b7980c4cb7bb0651438d4bca9996aba4d84249",
+    "transport.py": "e6d71a873e80ddd7a5d3a6dd1fe2cc433664478dca5d2af534ece5f4a1e013e7",
+    "web.py": "dde767c3492ee79af9d138f6da7f6d610685e767dc813285afedfbfefe1f8f82"
+  },
+  "source_sha256": "5fb627bc2644a122c8210614c4ba98867d87d2834fafc1c2ed0c9b256e036397"
+}
