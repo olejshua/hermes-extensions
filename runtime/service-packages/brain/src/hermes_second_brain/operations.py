@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from .dreaming.config import DreamingConfig
+from .dreaming.runner import _stored_run_health
 from .dreaming.store import DreamStore
 
 
@@ -93,6 +94,12 @@ def build_morning_report(
     rounds = latest.get("rounds", 0)
     if type(rounds) is not int:
         rounds = 0
+    health = _stored_run_health(last_status, rounds, latest.get("summary"))
+    health_note = {
+        "ok": " (ok)",
+        "no_work": " (keine Arbeit im Lauf)",
+        "degraded_profile": " (Profilfehler im Lauf)",
+    }.get(health, "")
     publications = dream.publication_counts()
     staging = dream.staging_counts()
     pending_sessions = dream.pending_source_count()
@@ -117,7 +124,7 @@ def build_morning_report(
     lines = [
         f"Hermes Morgenlage · {clock.astimezone(config.tzinfo()).date().isoformat()}",
         *([f"Liefer-ID: {delivery_id}"] if delivery_id else []),
-        f"Dream-Gesundheit: {last_status}; abgeschlossene Runden im letzten Lauf: {max(0, rounds)}",
+        f"Dream-Gesundheit: {last_status}{health_note}; abgeschlossene Runden im letzten Lauf: {max(0, rounds)}",
         f"Dream-Rückstand: {max(0, pending_sessions)} Sessions",
         (
             "Publikationswarteschlange: "
