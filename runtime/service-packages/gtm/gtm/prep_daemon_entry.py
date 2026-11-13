@@ -59,7 +59,7 @@ def build_evidence(permission, allowed, client_factory=None, mail=None):
     return CombinedEvidence(*collectors), collectors[0]
 
 
-def build_drafter(permission, complete_factory=None):
+def build_drafter(permission, complete_factory=None, ledger=None):
     """Echo drafter unless the permission file names synthesis mode dry_run/on AND a completion
     factory is injected. This module ships no factory, holds no key and chooses no model, so
     today every path returns the deterministic echo. Naming a mode without a factory is a stop,
@@ -75,7 +75,11 @@ def build_drafter(permission, complete_factory=None):
     approved = (permission.get('synthesis') or {}).get('transmission_approved') is True
     if not approved:
         raise ReviewRequired('synthesis_transmission_not_approved')
-    return ModelPrepDrafter(complete_factory(permission), mode, transmission_approved=True)
+    if ledger is None:
+        raise ReviewRequired('synthesis_attempt_ledger_required')
+    cfg = permission.get('synthesis') or {}
+    scope = '|'.join((str(permission.get('owner')), 'openai-codex', str(cfg.get('model')), 'prep'))
+    return ModelPrepDrafter(complete_factory(permission), mode, transmission_approved=True, ledger=ledger, scope=scope)
 
 
 def main():
@@ -100,7 +104,8 @@ def main():
     commitments = CommitmentStore(private_dir(args.state) / 'commitments.sqlite3')
     reads, sender = CalendarReads(), PrivateSender(args.state)
     evidence, _ = build_evidence(permission, allowed)
-    drafter = build_drafter(permission)
+    from gtm.synthesis import ModelLedger
+    drafter = build_drafter(permission, ledger=ModelLedger(private_dir(args.state) / 'model-attempts.sqlite3'))
     while True:
         try:
             report = tick(reads, store, sender, evidence, drafter, now=dt.datetime.now(dt.timezone.utc),

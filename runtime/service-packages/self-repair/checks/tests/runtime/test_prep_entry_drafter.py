@@ -21,12 +21,16 @@ class T(unittest.TestCase):
         with self.assertRaises(ReviewRequired):
             build_drafter({'synthesis': {'mode': 'on'}}, lambda p: (lambda x: '{}'))
 
+    def test_approved_mode_without_ledger_stops(self):
+        with self.assertRaises(ReviewRequired):
+            build_drafter({'synthesis': {'mode': 'on', 'transmission_approved': True}}, lambda p: (lambda x: '{}'))
+
     def test_unknown_mode_stops(self):
         with self.assertRaises(ReviewRequired):
             build_drafter({'synthesis': {'mode': 'auto'}})
 
     def test_injected_factory_builds_model_drafter(self):
-        d = build_drafter({'synthesis': {'mode': 'dry_run', 'transmission_approved': True}}, lambda p: (lambda prompt: '{}'))
+        d = build_drafter({'synthesis': {'mode': 'dry_run', 'transmission_approved': True}}, lambda p: (lambda prompt: '{}'), ledger=object())
         self.assertIsInstance(d, ModelPrepDrafter); self.assertEqual(d.mode, 'dry_run')
 
 if __name__ == '__main__':
