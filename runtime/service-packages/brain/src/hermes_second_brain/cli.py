@@ -500,7 +500,16 @@ def main(argv: list[str] | None = None) -> int:
     dr.add_argument("--config", "--manifest", dest="config", type=Path, required=True)
     dr.add_argument("--claim", action="store_true")
     dr.add_argument("--claim-owner")
+    dr.add_argument("--no-ack", action="store_true",
+                    help="claim and print without marking delivered; finish with dream-report-ack and a send receipt")
     dr.add_argument("--json", action="store_true")
+
+    da = sub.add_parser("dream-report-ack")
+    da.add_argument("--config", "--manifest", dest="config", type=Path, required=True)
+    da.add_argument("--report-id", required=True)
+    da.add_argument("--claim-owner", required=True)
+    da.add_argument("--message-id", required=True, help="numeric message id from the native send receipt")
+    da.add_argument("--platform", default="telegram")
 
     args = parser.parse_args(argv)
     configure_logging(args.verbose)
@@ -796,6 +805,20 @@ def main(argv: list[str] | None = None) -> int:
             last = status.get("last_run") or {}
             print(f"enabled={str(status.get('enabled', False)).lower()} active={str(bool(status.get('active'))).lower()} last={last.get('status', 'never')} phase={last.get('last_phase') or '-'} openviking_classified={status.get('openviking_classified', 0)} failures={status.get('failures', 0)}")
         return 0
+    if args.cmd == "dream-report-ack":
+        try:
+            config = load_dreaming_config(args.config)
+            from .dreaming.runner import ReportDelivery, acknowledge_dream_report_receipt
+            ok = acknowledge_dream_report_receipt(
+                config, ReportDelivery(text="", report_id=args.report_id, owner=args.claim_owner),
+                {"success": True, "message_id": args.message_id, "platform": args.platform})
+        except Exception as exc:
+            print(f"dream-report-ack: {_safe_cli_error(exc)}", file=sys.stderr)
+            return 1
+        if not ok:
+            print("dream-report-ack: receipt or claim not accepted", file=sys.stderr)
+            return 1
+        return 0
     if args.cmd == "dream-report":
         delivery = None
         try:
@@ -806,11 +829,14 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 report = dream_report(config)
             if args.json:
-                print(_json({"available": report is not None, "claimed": bool(delivery), "report": report}))
+                print(_json({"available": report is not None, "claimed": bool(delivery), "report": report,
+                             **({"report_id": delivery.report_id, "claim_owner": delivery.owner} if delivery else {})}))
             elif report is not None:
                 print(report, end="" if report.endswith("\n") else "\n")
             sys.stdout.flush()
-            if delivery is not None and not acknowledge_dream_report(config, delivery):
+            if delivery is not None and args.no_ack:
+                pass  # stdout is a hand-off, not a delivery; the lease stays until dream-report-ack or it expires
+            elif delivery is not None and not acknowledge_dream_report(config, delivery):
                 raise RuntimeError("report acknowledgement fence was lost")
         except Exception as exc:
             if delivery is not None:

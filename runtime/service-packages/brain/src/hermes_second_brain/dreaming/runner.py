@@ -298,6 +298,7 @@ def dream_status(config: DreamingConfig) -> dict[str, Any]:
         "candidates": {},
         "candidate_explanations": [],
         "openviking_classified": 0,
+        "reports_delivered_without_receipt": 0,
         "private_context_candidates": 0,
         "publication_queue": {},
         "proposal_staging": {},
@@ -354,6 +355,7 @@ def dream_status(config: DreamingConfig) -> dict[str, Any]:
                 item["target"] == "openviking_dream" for item in store.promotions()
             ),
             "private_context_candidates": sum(item["target"] == "context_inbox" for item in store.promotions()),
+            "reports_delivered_without_receipt": store.reports_delivered_without_receipt(),
             "publication_queue": store.publication_counts(),
             "proposal_staging": store.staging_counts(),
             "failures": [_public_phase(item) for item in store.recent_failures()],
@@ -392,6 +394,11 @@ def claim_dream_report(config: DreamingConfig, *, owner: str | None = None) -> R
 
 def acknowledge_dream_report(config: DreamingConfig, delivery: ReportDelivery) -> bool:
     return DreamStore(config.dream_state_db).ack_report(delivery.report_id, delivery.owner)
+
+
+def acknowledge_dream_report_receipt(config: DreamingConfig, delivery: ReportDelivery, receipt: dict[str, Any]) -> bool:
+    """Complete a claimed plain report only with a native send receipt."""
+    return DreamStore(config.dream_state_db).ack_report_receipt(delivery.report_id, delivery.owner, receipt)
 
 
 def release_dream_report(config: DreamingConfig, delivery: ReportDelivery) -> bool:
