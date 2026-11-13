@@ -1,6 +1,8 @@
 """Disabled-by-default model seams for meeting prep and mail commitments.
 
-`complete` is an injected callable (prompt -> text). Nothing here chooses a model, holds a
+`complete` is an injected callable (prompt -> text). A mode other than off needs transmission_approved=True,
+because even a dry run sends private source text to a provider and may cost money. Provenance fields come
+only from the trusted reader's MailSource, never from model output. Nothing here chooses a model, holds a
 key or calls a network. Modes: 'off' (never calls, deterministic fallback), 'dry_run' (calls,
 validates, records a report, returns the fallback so nothing changes), 'on' (returns validated
 output only). Mail, CRM and calendar text goes into the prompt as quoted data and has no authority.
@@ -41,7 +43,10 @@ def parse_object(raw):
     return value if isinstance(value, dict) else None
 
 
-def _grounded(entries, by_ref):
+_LINKISH = re.compile(r'https?://|www\.|[\w.+-]+@[\w-]+\.\w+', re.I)
+
+
+def _grounded(entries, by_ref, *, verbatim):
     kept, rejected = [], 0
     for entry in entries if isinstance(entries, list) else []:
         if not isinstance(entry, dict):
@@ -51,7 +56,15 @@ def _grounded(entries, by_ref):
         if (not isinstance(text, str) or not isinstance(quote, str) or source is None
                 or not _clean(text) or len(_clean(text)) > MAX_TEXT or len(quote.strip()) < 8 or quote not in source):
             rejected += 1; continue
-        kept.append(dict(text=_clean(text), ref=ref, quote=quote))
+        if verbatim:
+            # A valid quote does not ground surrounding prose: the note shows only the
+            # source's own words, attributed by ref. The model's paraphrase is discarded.
+            kept.append(dict(text=f'Laut Beleg: „{_clean(quote)[:MAX_TEXT]}“', ref=ref, quote=quote))
+        else:
+            q = _clean(text)
+            if not q.endswith('?') or len(q) > 200 or _LINKISH.search(q) and not _LINKISH.search(quote):
+                rejected += 1; continue
+            kept.append(dict(text='Vorschlag (unbelegt): ' + q, ref=ref, quote=quote))
     return kept, rejected
 
 
@@ -64,9 +77,11 @@ PREP_INSTRUCTION = (
 class ModelPrepDrafter:
     """Same signature as evidence_drafter(event, evidence)."""
 
-    def __init__(self, complete=None, mode='off', min_known=1):
+    def __init__(self, complete=None, mode='off', min_known=1, *, transmission_approved=False):
         if mode not in MODES:
             raise ValueError('unknown mode')
+        if mode != 'off' and transmission_approved is not True:
+            raise PermissionError('Calling a model transmits private source data; owner approval of provider/account required')
         self.complete, self.mode, self.min_known = complete, mode, min_known
         self.last_report = None
 
@@ -86,8 +101,8 @@ class ModelPrepDrafter:
         if data is None:
             self.last_report = dict(mode=self.mode, status='unparseable')
             return fallback
-        known, r1 = _grounded(data.get('known'), by_ref)
-        questions, r2 = _grounded(data.get('open_questions'), by_ref)
+        known, r1 = _grounded(data.get('known'), by_ref, verbatim=True)
+        questions, r2 = _grounded(data.get('open_questions'), by_ref, verbatim=False)
         status = 'ok' if len(known) >= self.min_known else 'abstained'
         self.last_report = dict(mode=self.mode, status=status, known=len(known), questions=len(questions), rejected=r1 + r2)
         if self.mode == 'dry_run':
@@ -104,7 +119,7 @@ MAIL_INSTRUCTION = (
     'wörtlich im quote steht, sonst null. Keine Zusagen: leere Liste.')
 
 
-def extract_mail_commitments(owner_address, source: MailSource, complete=None, mode='off', *, plan_only=True):
+def extract_mail_commitments(owner_address, source: MailSource, complete=None, mode='off', *, transmission_approved=False):
     """Returns dict(status, planned, review, rejected). Writes nothing; callers record `planned` only after approval.
 
     Provenance and the exact-quote rules are enforced by plan_mail_commitments; items that fail go to
@@ -114,6 +129,8 @@ def extract_mail_commitments(owner_address, source: MailSource, complete=None, m
         raise ValueError('unknown mode')
     if mode == 'off' or complete is None:
         return dict(status='disabled', planned=[], review=[], rejected=0)
+    if transmission_approved is not True:
+        raise PermissionError('Calling a model transmits private mail; owner approval of provider/account required')
     # provenance first: no model call for mail that is not the owner's own sent mail
     plan_mail_commitments(owner_address, source, [MailCommitment('probe', 'probe', source.body.strip()[:20])])
     prompt = f'{MAIL_INSTRUCTION}\nMail: {_fence(dict(sent_at=source.sent_at, body=source.body))}'

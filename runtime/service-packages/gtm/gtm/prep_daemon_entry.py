@@ -17,6 +17,7 @@ from gtm.prep import PrepConfig
 from gtm.prep_adapters import (CalendarReads, CombinedEvidence, MailEvidence, PrivateSender, TwentyEvidence,
                                Unconfigured, evidence_drafter)
 from gtm.prep_daemon import PrepStore, tick
+from gtm.synthesis import MODES, ModelPrepDrafter
 from gtm.commitments import CommitmentStore, commitment_tick
 from zoneinfo import ZoneInfo
 
@@ -58,6 +59,25 @@ def build_evidence(permission, allowed, client_factory=None, mail=None):
     return CombinedEvidence(*collectors), collectors[0]
 
 
+def build_drafter(permission, complete_factory=None):
+    """Echo drafter unless the permission file names synthesis mode dry_run/on AND a completion
+    factory is injected. This module ships no factory, holds no key and chooses no model, so
+    today every path returns the deterministic echo. Naming a mode without a factory is a stop,
+    not a silent downgrade."""
+    mode = (permission.get('synthesis') or {}).get('mode', 'off')
+    if mode not in MODES:
+        raise ReviewRequired('unknown_synthesis_mode')
+    if mode == 'off':
+        return evidence_drafter
+    if complete_factory is None:
+        raise ReviewRequired('synthesis_completion_not_configured')
+    # The owner's approval of provider/account is a separate, explicit field; configuration alone is not approval.
+    approved = (permission.get('synthesis') or {}).get('transmission_approved') is True
+    if not approved:
+        raise ReviewRequired('synthesis_transmission_not_approved')
+    return ModelPrepDrafter(complete_factory(permission), mode, transmission_approved=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--activate', action='store_true')
@@ -80,9 +100,10 @@ def main():
     commitments = CommitmentStore(private_dir(args.state) / 'commitments.sqlite3')
     reads, sender = CalendarReads(), PrivateSender(args.state)
     evidence, _ = build_evidence(permission, allowed)
+    drafter = build_drafter(permission)
     while True:
         try:
-            report = tick(reads, store, sender, evidence, evidence_drafter, now=dt.datetime.now(dt.timezone.utc),
+            report = tick(reads, store, sender, evidence, drafter, now=dt.datetime.now(dt.timezone.utc),
                           config=config, allowed_sources=allowed, own_addresses=(CODE,), activate=args.activate)
             print(json.dumps({k: v for k, v in report.items() if k != 'notes'}), flush=True)
             if 'commitments' in allowed:
