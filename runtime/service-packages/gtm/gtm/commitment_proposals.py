@@ -83,6 +83,13 @@ class ProposalStore:
         finally:
             db.close()
 
+    def in_state(self, state):
+        db = self._db()
+        try:
+            return [dict(r) for r in db.execute('SELECT * FROM proposal WHERE state=? ORDER BY rowid', (state,))]
+        finally:
+            db.close()
+
     def pending(self):
         db = self._db()
         try:
@@ -90,13 +97,13 @@ class ProposalStore:
         finally:
             db.close()
 
-    def decide(self, ref, state):
-        if state not in ('confirmed', 'dismissed'):
+    def decide(self, ref, state, only_from='pending'):
+        if state not in ('confirming', 'confirmed', 'dismissed', 'unknown_needs_review'):
             raise ValueError('unknown_state')
         db = self._db()
         try:
             with db:
-                return db.execute("UPDATE proposal SET state=? WHERE ref=? AND state='pending'", (state, ref)).rowcount == 1
+                return db.execute("UPDATE proposal SET state=? WHERE ref=? AND state=?", (state, ref, only_from)).rowcount == 1
         finally:
             db.close()
 
@@ -113,20 +120,32 @@ def confirmation_phrase(row):
     return base + (' trotz Hinweisen' if row['flags'] else '')
 
 
-def native_confirmation_record(event, gateway, policy):
-    """Hermes-native evidence for one inbound Telegram event, or None.
+class UnprovenEventContract:
+    """Default: the upstream gateway event contract is not established from this repo, so every
+    judgement is unknown and confirmation abstains. A trusted gateway adapter replaces this with
+    explicit positive proof (is_human_inbound, is_current_unedited) taken from fields it has verified
+    on the real event class. Absence of an attribute is never treated as proof."""
 
-    Uses the same checks the dialogue plugin applies to owner messages: not an internal event, the
-    source is bound to the owner's private chat (DialoguePolicy.bound: telegram, owner user and chat,
-    private chat type, profile, not a bot), and the gateway's own authorization for that source. An
-    event that marks itself edited or as a bot message is refused when those attributes exist (the repo
-    does not show the event class, so absence is not proof of an unedited message; replay protection
-    below limits what a repeated or edited resend can do).
-    """
+    def is_human_inbound(self, event):
+        return None
+
+    def is_current_unedited(self, event):
+        return None
+
+
+def native_confirmation_record(event, gateway, policy, contract=None):
+    """Hermes-native evidence for one inbound Telegram event, or None (abstain).
+
+    Needs: not internal (explicit False), source bound to the owner's private chat (DialoguePolicy.bound),
+    gateway authorization, and POSITIVE proof from the event contract that the message is human inbound
+    and current/unedited. Unknown proof abstains."""
+    contract = contract or UnprovenEventContract()
     source = getattr(event, 'source', None)
-    if (getattr(event, 'internal', False) or source is None or not policy.bound(source)
-            or not gateway._is_user_authorized_for_source(source)
-            or getattr(event, 'edited', False) or getattr(event, 'is_edit', False)):
+    if getattr(event, 'internal', None) is not False or source is None or not policy.bound(source):
+        return None
+    if gateway._is_user_authorized_for_source(source) is not True:
+        return None
+    if contract.is_human_inbound(event) is not True or contract.is_current_unedited(event) is not True:
         return None
     mid = str(getattr(event, 'message_id', '') or '')
     text = getattr(event, 'text', None)
@@ -149,9 +168,40 @@ class ConsumedMessages:
             return db.execute('INSERT OR IGNORE INTO consumed(message_id) VALUES(?)', (message_id,)).rowcount == 1
 
 
-def confirm_from_owner_event(proposals, commitments, service, owner_address, *, ref, event, gateway, policy, consumed):
+def reconcile(proposals: ProposalStore, commitments):
+    """Resolve proposals stuck in 'confirming' after a crash. Written commitment -> confirmed; none -> unknown_needs_review
+    (not retried automatically, not shown as done)."""
+    out = {'confirmed': 0, 'unknown': 0}
+    for row in proposals.in_state('confirming'):
+        with commitments.connect() as db:
+            present = db.execute('SELECT 1 FROM commitment WHERE ref=?', (row['ref'],)).fetchone() is not None
+        if present:
+            proposals.decide(row['ref'], 'confirmed', only_from='confirming'); out['confirmed'] += 1
+        else:
+            proposals.decide(row['ref'], 'unknown_needs_review', only_from='confirming'); out['unknown'] += 1
+    return out
+
+
+def render_pending(proposals: ProposalStore):
+    """Owner-private note section. Render only: no send. Phrases are provisional UX."""
+    lines = []
+    pending = proposals.pending()
+    if pending:
+        lines.append('Mögliche Zusagen aus deinen gesendeten Mails (noch nichts übernommen):')
+        for row in pending:
+            hint = f" [Hinweise: {row['flags'].replace(',', ', ')}]" if row['flags'] else ''
+            due = f", Frist {row['due'][:10]}" if row['due'] else ''
+            lines.append(f"- {row['title']}{due}{hint}\n  Beleg: „{row['quote'][:200]}“\n  Zum Übernehmen antworten: {confirmation_phrase(row)}")
+    unclear = proposals.in_state('confirming') + proposals.in_state('unknown_needs_review')
+    if unclear:
+        lines.append('Unklar, ob übernommen (bitte prüfen):')
+        lines += [f"- {row['title']}" for row in unclear]
+    return '\n'.join(lines)
+
+
+def confirm_from_owner_event(proposals, commitments, service, owner_address, *, ref, event, gateway, policy, consumed, contract=None):
     """Hermes-native confirmation: the inbound gateway event is the evidence; no cross-system lookup."""
-    record = native_confirmation_record(event, gateway, policy)
+    record = native_confirmation_record(event, gateway, policy, contract)
     if record is None:
         raise ValueError('not_an_owner_private_inbound_message')
     if not consumed.claim(record['message_id']):
@@ -181,10 +231,12 @@ def confirm_from_owner_message(proposals: ProposalStore, commitments, service, o
     now, _count = thread_fingerprint(service, owner_address, thread_id)  # raises on unreadable: stays review
     if now != row['thread_hash']:
         raise ValueError('thread_changed_since_proposal')
-    # claim the decision first: of two concurrent confirmations only one commits
-    if not proposals.decide(ref, 'confirmed'):
+    # claim first (single winner), write, then mark confirmed. A crash in between leaves 'confirming',
+    # which reconcile() resolves from the store; it is never shown as completed.
+    if not proposals.decide(ref, 'confirming'):
         raise ValueError('proposal_already_decided')
     commitments.add(row['title'], row['ref'], row['due'], 'date' if row['due'] else 'time')
+    proposals.decide(ref, 'confirmed', only_from='confirming')
 
 
 def propose_from_thread(service, owner_address, thread_id, proposals: ProposalStore, *, complete=None, mode='off',

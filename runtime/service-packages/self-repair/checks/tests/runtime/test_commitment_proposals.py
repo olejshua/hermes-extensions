@@ -3,7 +3,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / 'gtm'))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from gtm.commitment_proposals import ConsumedMessages, confirm_from_owner_event, ProposalStore, confirm_from_owner_message, confirmation_phrase, flags_for, propose_from_thread  # noqa: E402
+from gtm.commitment_proposals import ConsumedMessages, reconcile, render_pending, UnprovenEventContract, confirm_from_owner_event, ProposalStore, confirm_from_owner_message, confirmation_phrase, flags_for, propose_from_thread  # noqa: E402
 from gtm.commitments import CommitmentStore  # noqa: E402
 from gtm.mail_commitments import MailCommitment, MailSource  # noqa: E402
 from test_gmail_mail_source import Svc, msg, OWNER  # noqa: E402
@@ -15,6 +15,14 @@ def S(body):
 
 def item(q):
     return MailCommitment('a', 'x', q)
+
+
+class Proven:
+    def is_human_inbound(self, e): return True
+    def is_current_unedited(self, e): return not getattr(e, 'edited', False)
+
+
+PROVEN = Proven()
 
 
 class Flags(unittest.TestCase):
@@ -137,10 +145,10 @@ class Flow(unittest.TestCase):
         ev = dict(source=src, internal=False, message_id='tg-1', text=None); ev.update(ov)
         return pol, gw, types.SimpleNamespace(**ev)
 
-    def event_confirm(self, msgs, row, consumed, **ov):
+    def event_confirm(self, msgs, row, consumed, contract=None, **ov):
         pol, gw, ev = self.native(text=confirmation_phrase(row), **ov)
         return confirm_from_owner_event(self.props, self.commit, Svc(OWNER, msgs), OWNER, ref=row['ref'], event=ev, gateway=gw,
-                                        policy=pol, consumed=consumed)
+                                        policy=pol, consumed=consumed, contract=contract or PROVEN)
 
     def test_native_event_provenance_is_required(self):
         base = [msg('m1', ['SENT'], body='ich schicke das Angebot')]
@@ -153,10 +161,10 @@ class Flow(unittest.TestCase):
         pol, gw, ev = self.native(text=confirmation_phrase(row))
         ev.source.is_bot = True
         with self.assertRaises(ValueError):
-            confirm_from_owner_event(self.props, self.commit, Svc(OWNER, base), OWNER, ref=row['ref'], event=ev, gateway=gw, policy=pol, consumed=consumed)
+            confirm_from_owner_event(self.props, self.commit, Svc(OWNER, base), OWNER, ref=row['ref'], event=ev, gateway=gw, policy=pol, consumed=consumed, contract=PROVEN)
         ev.source.is_bot = False; ev.source.chat_type = 'group'
         with self.assertRaises(ValueError):
-            confirm_from_owner_event(self.props, self.commit, Svc(OWNER, base), OWNER, ref=row['ref'], event=ev, gateway=gw, policy=pol, consumed=consumed)
+            confirm_from_owner_event(self.props, self.commit, Svc(OWNER, base), OWNER, ref=row['ref'], event=ev, gateway=gw, policy=pol, consumed=consumed, contract=PROVEN)
         self.assertEqual(self.count(), 0)
         self.event_confirm(base, row, consumed)
         self.assertEqual(self.count(), 1)
@@ -186,6 +194,47 @@ class Flow(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             self.event_confirm(base, row, consumed)
         self.assertIn('already_used', str(ctx.exception)); self.assertEqual(self.count(), 0)
+
+    def test_unproven_event_contract_abstains_and_does_not_consume(self):
+        base = [msg('m1', ['SENT'], body='ich schicke das Angebot')]
+        self.run_flow(base); row = self.props.pending()[0]
+        consumed = ConsumedMessages(Path(self.tmp.name) / 'u.db')
+        pol, gw, ev = self.native(text=confirmation_phrase(row))
+        with self.assertRaises(ValueError):
+            confirm_from_owner_event(self.props, self.commit, Svc(OWNER, base), OWNER, ref=row['ref'], event=ev, gateway=gw,
+                                     policy=pol, consumed=consumed)
+        self.assertTrue(consumed.claim('tg-1'))      # abstention left the message unconsumed
+        self.assertTrue(isinstance(UnprovenEventContract().is_current_unedited(ev), type(None)))
+        # a missing 'internal' attribute is not proof of a human message
+        del ev.internal
+        with self.assertRaises(ValueError):
+            confirm_from_owner_event(self.props, self.commit, Svc(OWNER, base), OWNER, ref=row['ref'], event=ev, gateway=gw,
+                                     policy=pol, consumed=ConsumedMessages(Path(self.tmp.name) / 'u2.db'), contract=PROVEN)
+
+    def test_crash_between_claim_and_write_is_unknown_not_completed(self):
+        base = [msg('m1', ['SENT'], body='ich schicke das Angebot')]
+        self.run_flow(base); row = self.props.pending()[0]
+        self.assertTrue(self.props.decide(row['ref'], 'confirming'))     # claimed, process dies before commitments.add
+        self.assertEqual(self.props.pending(), [])
+        self.assertIn('Unklar', render_pending(self.props))
+        self.assertEqual(reconcile(self.props, self.commit), {'confirmed': 0, 'unknown': 1})
+        self.assertEqual(self.count(), 0); self.assertEqual(len(self.props.in_state('unknown_needs_review')), 1)
+        self.assertIn('Unklar', render_pending(self.props))
+
+    def test_crash_after_write_before_mark_reconciles_to_confirmed(self):
+        base = [msg('m1', ['SENT'], body='ich schicke das Angebot')]
+        self.run_flow(base); row = self.props.pending()[0]
+        self.props.decide(row['ref'], 'confirming'); self.commit.add(row['title'], row['ref'])
+        self.assertEqual(reconcile(self.props, self.commit), {'confirmed': 1, 'unknown': 0})
+        self.assertEqual(render_pending(self.props), '')
+
+    def test_render_shows_evidence_flags_and_phrase_without_committing(self):
+        msgs = [msg('m1', ['SENT'], body='ich schicke das Angebot'), msg('m2', ['SENT'], body='Das kann ich nicht mehr liefern.', stamp='1794560001000')]
+        self.run_flow(msgs); row = self.props.pending()[0]
+        text = render_pending(self.props)
+        self.assertIn('noch nichts übernommen', text); self.assertIn('„ich schicke das Angebot“', text)
+        self.assertIn('later_own_message_may_withdraw', text); self.assertIn(confirmation_phrase(row), text)
+        self.assertEqual(self.count(), 0)
 
 if __name__ == '__main__':
     unittest.main()
