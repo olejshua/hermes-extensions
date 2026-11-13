@@ -115,3 +115,49 @@ class Producer(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class Precision(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.store = CommitmentStore(Path(self.dir.name) / 'c.db')
+
+    def test_date_only_deadline_is_never_rendered_with_our_cutoff_hour(self):
+        record_call_commitments(self.store, analysis([OLE]))
+        message = []
+
+        class Sender:
+            def send(self_inner, key, text):
+                message.append(text)
+                return {'success': True, 'message_id': 'm'}
+        commitment_tick(self.store, Sender(), dt.datetime(2026, 11, 20, 9, tzinfo=TZ), TZ, activate=True)
+        self.assertIn('20.11.', message[0])
+        self.assertNotIn('18:00', message[0])
+
+    def test_explicit_source_time_and_zone_are_kept_and_rendered(self):
+        self.store.add('Rückruf', 'mail:1', '2026-11-20T15:30:00+01:00')
+        with self.store.connect() as db:
+            row = dict(db.execute('SELECT * FROM commitment').fetchone())
+        self.assertEqual((row['due'], row['due_precision']), ('2026-11-20T15:30:00+01:00', 'time'))
+        from gtm.commitments import render_digest
+        self.assertIn('15:30', render_digest([row], dt.datetime(2026, 11, 20, 9, tzinfo=TZ), TZ))
+
+    def test_old_database_without_precision_column_is_migrated(self):
+        import sqlite3
+        path = Path(self.dir.name) / 'old.db'
+        db = sqlite3.connect(path)
+        db.execute('CREATE TABLE commitment(id INTEGER PRIMARY KEY, text TEXT NOT NULL, ref TEXT NOT NULL UNIQUE, due TEXT, '
+                   'state TEXT NOT NULL DEFAULT "open", last_reminder_receipt TEXT, last_reminded REAL)')
+        db.execute("INSERT INTO commitment(text,ref,due) VALUES('alt','r','2026-11-20T10:00:00+01:00')")
+        db.commit()
+        db.close()
+        store = CommitmentStore(path)
+        with store.connect() as conn:
+            self.assertEqual(conn.execute('SELECT due_precision FROM commitment').fetchone()[0], 'time')
+
+    def test_date_only_is_not_overdue_on_its_own_day_after_the_cutoff(self):
+        from gtm.commitments import render_digest
+        row = {'text': 'x', 'due': '2026-11-20T18:00:00+01:00', 'due_precision': 'date'}
+        self.assertIn('fällig 20.11.', render_digest([row], dt.datetime(2026, 11, 20, 21, tzinfo=TZ), TZ))
+        self.assertIn('überfällig seit 20.11.', render_digest([row], dt.datetime(2026, 11, 21, 8, tzinfo=TZ), TZ))

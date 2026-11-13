@@ -19,7 +19,9 @@ class CommitmentStore:
         self.path = Path(path); self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
             db.execute('CREATE TABLE IF NOT EXISTS commitment(id INTEGER PRIMARY KEY, text TEXT NOT NULL, ref TEXT NOT NULL UNIQUE, '
-                       'due TEXT, state TEXT NOT NULL DEFAULT "open", last_reminder_receipt TEXT, last_reminded REAL)')
+                       'due TEXT, state TEXT NOT NULL DEFAULT "open", last_reminder_receipt TEXT, last_reminded REAL, due_precision TEXT NOT NULL DEFAULT "time")')
+            if 'due_precision' not in {r[1] for r in db.execute('PRAGMA table_info(commitment)')}:
+                db.execute('ALTER TABLE commitment ADD COLUMN due_precision TEXT NOT NULL DEFAULT "time"')
             db.execute('CREATE TABLE IF NOT EXISTS digest(id INTEGER PRIMARY KEY, refs TEXT NOT NULL, message TEXT NOT NULL, '
                        'state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, receipt TEXT, updated REAL NOT NULL)')
         self.path.chmod(0o600)
@@ -31,14 +33,15 @@ class CommitmentStore:
             with db: yield db
         finally: db.close()
 
-    def add(self, text, ref, due=None):
+    def add(self, text, ref, due=None, due_precision='time'):
+        if due_precision not in ('time', 'date'): raise ValueError('unknown_due_precision')
         if not text.strip() or not ref.strip():
             raise ValueError('commitment_requires_text_and_source_ref')
         if due is not None:
             moment = dt.datetime.fromisoformat(due)
             if moment.tzinfo is None: raise ValueError('due_requires_offset')
         with self.connect() as db:
-            db.execute('INSERT OR IGNORE INTO commitment(text,ref,due) VALUES(?,?,?)', (text.strip(), ref.strip(), due))
+            db.execute('INSERT OR IGNORE INTO commitment(text,ref,due,due_precision) VALUES(?,?,?,?)', (text.strip(), ref.strip(), due, due_precision))
 
     def close(self, ref, state='done'):
         if state not in ('done', 'dropped'): raise ValueError('unknown_state')
@@ -72,8 +75,12 @@ def render_digest(rows, now, tz):
     lines = []
     for row in rows[:5]:
         due = dt.datetime.fromisoformat(row['due']).astimezone(tz)
-        status = 'überfällig seit' if dt.datetime.fromisoformat(row['due']) < now else 'fällig'
-        lines.append(f"{row['text']} ({status} {due:%d.%m. %H:%M})")
+        moment = dt.datetime.fromisoformat(row['due'])
+        late = now.astimezone(tz).date() > moment.astimezone(tz).date() if row.get('due_precision') == 'date' else moment < now
+        status = 'überfällig seit' if late else 'fällig'
+        # A date-only source deadline is shown as a date; the stored hour is only our reminder cut-off.
+        when = f'{due:%d.%m.}' if row.get('due_precision') == 'date' else f'{due:%d.%m. %H:%M}'
+        lines.append(f"{row['text']} ({status} {when})")
     head = 'Offene Zusage von dir: ' if len(lines) == 1 else 'Offene Zusagen von dir: '
     return head + '; '.join(lines) + '. Soll ich etwas davon vorbereiten? Nichts davon wurde nach außen geschickt.'
 
@@ -157,8 +164,10 @@ def record_call_commitments(store, analysis, *, tz=None, due_hour=18):
 
     Only items the analysis explicitly assigns to the owner count; 'other' and
     'unclear' stay with the Monolith review. A date comes only from the
-    analysis' evidenced absolute deadline (due_hour is a design default, not an
-    owner preference); no date means tracked without a reminder. Returns the
+    analysis' evidenced absolute deadline. That is date-only: it is stored with
+    due_precision='date' and the due_hour cut-off (a design default, not an owner
+    preference or the source deadline) only decides when a reminder may start and
+    is never rendered as the deadline. No date means tracked without a reminder. Returns the
     refs added. Nothing is sent to anyone.
     """
     import zoneinfo
@@ -173,6 +182,6 @@ def record_call_commitments(store, analysis, *, tz=None, due_hour=18):
             day = dt.datetime.strptime(item.due_date, '%Y-%m-%d')
             due = day.replace(hour=due_hour, tzinfo=zone).isoformat()
         ref = commitment_ref(analysis, item)
-        store.add(item.title, ref, due)
+        store.add(item.title, ref, due, 'date' if due else 'time')
         added.append(ref)
     return added
