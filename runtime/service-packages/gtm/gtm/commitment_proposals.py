@@ -113,11 +113,58 @@ def confirmation_phrase(row):
     return base + (' trotz Hinweisen' if row['flags'] else '')
 
 
+def native_confirmation_record(event, gateway, policy):
+    """Hermes-native evidence for one inbound Telegram event, or None.
+
+    Uses the same checks the dialogue plugin applies to owner messages: not an internal event, the
+    source is bound to the owner's private chat (DialoguePolicy.bound: telegram, owner user and chat,
+    private chat type, profile, not a bot), and the gateway's own authorization for that source. An
+    event that marks itself edited or as a bot message is refused when those attributes exist (the repo
+    does not show the event class, so absence is not proof of an unedited message; replay protection
+    below limits what a repeated or edited resend can do).
+    """
+    source = getattr(event, 'source', None)
+    if (getattr(event, 'internal', False) or source is None or not policy.bound(source)
+            or not gateway._is_user_authorized_for_source(source)
+            or getattr(event, 'edited', False) or getattr(event, 'is_edit', False)):
+        return None
+    mid = str(getattr(event, 'message_id', '') or '')
+    text = getattr(event, 'text', None)
+    if not mid or not isinstance(text, str):
+        return None
+    return dict(kind='message', message_id=mid, body=text, **{'from': policy.owner})
+
+
+class ConsumedMessages:
+    """Each owner message can attempt at most one confirmation, across restarts and threads."""
+
+    def __init__(self, path):
+        self.path = Path(path); self.path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.path) as db:
+            db.execute('CREATE TABLE IF NOT EXISTS consumed(message_id TEXT PRIMARY KEY)')
+        self.path.chmod(0o600)
+
+    def claim(self, message_id):
+        with sqlite3.connect(self.path, timeout=15) as db:
+            return db.execute('INSERT OR IGNORE INTO consumed(message_id) VALUES(?)', (message_id,)).rowcount == 1
+
+
+def confirm_from_owner_event(proposals, commitments, service, owner_address, *, ref, event, gateway, policy, consumed):
+    """Hermes-native confirmation: the inbound gateway event is the evidence; no cross-system lookup."""
+    record = native_confirmation_record(event, gateway, policy)
+    if record is None:
+        raise ValueError('not_an_owner_private_inbound_message')
+    if not consumed.claim(record['message_id']):
+        raise ValueError('confirmation_message_already_used')
+    confirm_from_owner_message(proposals, commitments, service, owner_address, ref=ref,
+                               message_id=record['message_id'], lookup=lambda _mid: record, owner_handle=policy.owner)
+
+
 def confirm_from_owner_message(proposals: ProposalStore, commitments, service, owner_address, *, ref, message_id,
                                lookup, owner_handle):
     """Commit a proposal only on authenticated owner-channel intent.
 
-    `lookup(message_id)` is the trusted channel record reader and returns {'from': handle, 'body': text, 'kind': 'message'}.
+    `lookup(message_id)` is a trusted channel record reader (in Hermes: native_confirmation_record over the gateway event) and returns {'from': handle, 'body': text, 'kind': 'message'}.
     The sender must be the verified owner handle, the text must be exactly the phrase bound to this
     proposal's version and flags (so an old, edited or other proposal's confirmation does not match),
     and the current full thread (inbound included) is re-read and must match the proposal's thread
@@ -134,8 +181,10 @@ def confirm_from_owner_message(proposals: ProposalStore, commitments, service, o
     now, _count = thread_fingerprint(service, owner_address, thread_id)  # raises on unreadable: stays review
     if now != row['thread_hash']:
         raise ValueError('thread_changed_since_proposal')
+    # claim the decision first: of two concurrent confirmations only one commits
+    if not proposals.decide(ref, 'confirmed'):
+        raise ValueError('proposal_already_decided')
     commitments.add(row['title'], row['ref'], row['due'], 'date' if row['due'] else 'time')
-    proposals.decide(ref, 'confirmed')
 
 
 def propose_from_thread(service, owner_address, thread_id, proposals: ProposalStore, *, complete=None, mode='off',

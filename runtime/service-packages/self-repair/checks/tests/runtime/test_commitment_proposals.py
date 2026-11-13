@@ -3,7 +3,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / 'gtm'))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from gtm.commitment_proposals import ProposalStore, confirm_from_owner_message, confirmation_phrase, flags_for, propose_from_thread  # noqa: E402
+from gtm.commitment_proposals import ConsumedMessages, confirm_from_owner_event, ProposalStore, confirm_from_owner_message, confirmation_phrase, flags_for, propose_from_thread  # noqa: E402
 from gtm.commitments import CommitmentStore  # noqa: E402
 from gtm.mail_commitments import MailCommitment, MailSource  # noqa: E402
 from test_gmail_mail_source import Svc, msg, OWNER  # noqa: E402
@@ -126,6 +126,66 @@ class Flow(unittest.TestCase):
             self.confirm(msgs, row, body=confirmation_phrase(dict(row, flags='')))
         self.confirm(msgs, row)
         self.assertEqual(self.count(), 1)
+
+    def native(self, **ov):
+        import types
+        src = types.SimpleNamespace(platform=types.SimpleNamespace(value='telegram'), user_id='42', chat_id='42', chat_type='private',
+                                    profile=None, is_bot=False, profile_route_rejected=False)
+        pol = types.SimpleNamespace(owner='telegram:42', bound=lambda s: (getattr(s, 'user_id', '') == '42' and s.chat_type == 'private'
+                                                                          and not s.is_bot))
+        gw = types.SimpleNamespace(_is_user_authorized_for_source=lambda s: ov.pop('authorized', True))
+        ev = dict(source=src, internal=False, message_id='tg-1', text=None); ev.update(ov)
+        return pol, gw, types.SimpleNamespace(**ev)
+
+    def event_confirm(self, msgs, row, consumed, **ov):
+        pol, gw, ev = self.native(text=confirmation_phrase(row), **ov)
+        return confirm_from_owner_event(self.props, self.commit, Svc(OWNER, msgs), OWNER, ref=row['ref'], event=ev, gateway=gw,
+                                        policy=pol, consumed=consumed)
+
+    def test_native_event_provenance_is_required(self):
+        base = [msg('m1', ['SENT'], body='ich schicke das Angebot')]
+        self.run_flow(base); row = self.props.pending()[0]
+        consumed = ConsumedMessages(Path(self.tmp.name) / 'u.db')
+        import types
+        for ov in (dict(internal=True), dict(authorized=False), dict(edited=True), dict(message_id='')):
+            with self.assertRaises(ValueError, msg=str(ov)):
+                self.event_confirm(base, row, consumed, **ov)
+        pol, gw, ev = self.native(text=confirmation_phrase(row))
+        ev.source.is_bot = True
+        with self.assertRaises(ValueError):
+            confirm_from_owner_event(self.props, self.commit, Svc(OWNER, base), OWNER, ref=row['ref'], event=ev, gateway=gw, policy=pol, consumed=consumed)
+        ev.source.is_bot = False; ev.source.chat_type = 'group'
+        with self.assertRaises(ValueError):
+            confirm_from_owner_event(self.props, self.commit, Svc(OWNER, base), OWNER, ref=row['ref'], event=ev, gateway=gw, policy=pol, consumed=consumed)
+        self.assertEqual(self.count(), 0)
+        self.event_confirm(base, row, consumed)
+        self.assertEqual(self.count(), 1)
+
+    def test_replay_and_concurrent_confirmation_commit_once(self):
+        import threading
+        base = [msg('m1', ['SENT'], body='ich schicke das Angebot')]
+        self.run_flow(base); row = self.props.pending()[0]
+        consumed = ConsumedMessages(Path(self.tmp.name) / 'u.db')
+        results = []
+        def go():
+            try:
+                self.event_confirm(base, row, consumed); results.append('ok')
+            except ValueError as exc:
+                results.append(str(exc))
+        ts = [threading.Thread(target=go) for _ in range(6)]
+        [t.start() for t in ts]; [t.join() for t in ts]
+        self.assertEqual(results.count('ok'), 1); self.assertEqual(self.count(), 1)
+
+    def test_message_used_for_a_stale_attempt_cannot_be_replayed(self):
+        base = [msg('m1', ['SENT'], body='ich schicke das Angebot')]
+        self.run_flow(base); row = self.props.pending()[0]
+        consumed = ConsumedMessages(Path(self.tmp.name) / 'u.db')
+        grown = base + [msg('m2', ['INBOX'], body='nein', frm='anna@example.invalid', stamp='1794560001000')]
+        with self.assertRaises(ValueError):
+            self.event_confirm(grown, row, consumed)
+        with self.assertRaises(ValueError) as ctx:
+            self.event_confirm(base, row, consumed)
+        self.assertIn('already_used', str(ctx.exception)); self.assertEqual(self.count(), 0)
 
 if __name__ == '__main__':
     unittest.main()
