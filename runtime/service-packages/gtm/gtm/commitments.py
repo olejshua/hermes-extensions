@@ -145,3 +145,34 @@ def commitment_tick(store, sender, now, tz, *, activate=False):
     elif report['unknown']:
         store.mark_uncertain(refs, now)
     return report
+
+
+def commitment_ref(analysis, item):
+    ident = analysis.identity
+    return f'call:{ident.category}:{ident.source_id}:v{ident.version}:{analysis.identity.source_hash[:12]}:{item.key}'
+
+
+def record_call_commitments(store, analysis, *, tz=None, due_hour=18):
+    """Producer: the owner's own evidenced action items from one checked call analysis.
+
+    Only items the analysis explicitly assigns to the owner count; 'other' and
+    'unclear' stay with the Monolith review. A date comes only from the
+    analysis' evidenced absolute deadline (due_hour is a design default, not an
+    owner preference); no date means tracked without a reminder. Returns the
+    refs added. Nothing is sent to anyone.
+    """
+    import zoneinfo
+    analysis.checked()
+    zone = tz or zoneinfo.ZoneInfo('Europe/Berlin')
+    added = []
+    for item in analysis.review_items:
+        if item.kind != 'action' or item.assignee != 'ole':
+            continue
+        due = None
+        if item.due_date:
+            day = dt.datetime.strptime(item.due_date, '%Y-%m-%d')
+            due = day.replace(hour=due_hour, tzinfo=zone).isoformat()
+        ref = commitment_ref(analysis, item)
+        store.add(item.title, ref, due)
+        added.append(ref)
+    return added
