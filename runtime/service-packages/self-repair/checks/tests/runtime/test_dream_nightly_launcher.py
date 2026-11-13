@@ -50,5 +50,58 @@ class Launcher(unittest.TestCase):
         self.assertEqual(code, 0); self.assertIn('dream_health=unknown', err)
 
 
+class ReportDelivery(unittest.TestCase):
+    def run_with(self, section, outcome=None, send_rc=0, sync_rc=0):
+        calls = []
+        outcome = outcome or {'status': 'complete', 'health': 'ok', 'rounds': 1}
+        def run(command, **kw):
+            calls.append([str(c) for c in command])
+            if command[0].endswith('dream_sweep.sh'):
+                return subprocess.CompletedProcess(command, 0, stdout=json.dumps(outcome))
+            if any(str(c).endswith('dream_report_send.py') for c in command):
+                return subprocess.CompletedProcess(command, send_rc)
+            if any(str(c).endswith('dream_sync.py') for c in command):
+                return subprocess.CompletedProcess(command, sync_rc)
+            return subprocess.CompletedProcess(command, 0, stdout='')
+        with tempfile.TemporaryDirectory() as d:
+            config = Path(d) / 'manifest.json'
+            config.write_text(json.dumps({'dreaming': {'sync_scope': 'dreams_only', **section}}))
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                code = nightly.main(['--project-dir', str(BRAIN), '--config', str(config)], run=run, now=NOW)
+        return code, calls, err.getvalue()
+
+    def native(self):
+        return {'command': ['/py', '-I', '-c', 'bootstrap', str(BRAIN / 'scripts/dream_native_adapter.py')]}
+
+    def sent(self, calls):
+        return [c for c in calls if any(x.endswith('dream_report_send.py') for x in c)]
+
+    def test_default_off_never_sends(self):
+        code, calls, err = self.run_with({'model': self.native()})
+        self.assertEqual((code, self.sent(calls)), (0, []))
+
+    def test_enabled_sends_once_through_native_python_after_safe_sync(self):
+        code, calls, err = self.run_with({'model': self.native(), 'report_delivery': {'enabled': True}})
+        sent = self.sent(calls)
+        self.assertEqual((code, len(sent)), (0, 1))
+        self.assertEqual(sent[0][:4], ['/py', '-I', '-c', 'bootstrap'])
+        self.assertIn('dream_report_delivery=ok', err)
+
+    def test_unconfirmed_send_is_logged_not_ok_and_does_not_change_exit(self):
+        code, _, err = self.run_with({'model': self.native(), 'report_delivery': {'enabled': True}}, send_rc=1)
+        self.assertEqual(code, 0); self.assertIn('dream_report_delivery=not_confirmed', err)
+        self.assertNotIn('dream_report_delivery=ok', err)
+
+    def test_unreviewed_native_command_blocks_without_running_anything(self):
+        code, calls, err = self.run_with({'model': {'command': ['/py', 'x']}, 'report_delivery': {'enabled': True}})
+        self.assertEqual(self.sent(calls), []); self.assertIn('blocked_invalid_native_command', err)
+
+    def test_failed_dream_run_sends_no_report(self):
+        code, calls, _ = self.run_with({'model': self.native(), 'report_delivery': {'enabled': True}},
+                                       outcome={'status': 'failed', 'health': 'failed'})
+        self.assertEqual((code, self.sent(calls)), (1, []))
+
+
 if __name__ == '__main__':
     unittest.main()
