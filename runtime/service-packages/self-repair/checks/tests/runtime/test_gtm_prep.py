@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 import unittest
-from gtm.prep import PrepDue, due_preparation, render_prep, qualifies
+from gtm.prep import PrepConfig, PrepDue, due_preparation, render_prep, qualifies
 
 OWN = ('me@example.invalid',)
 
@@ -31,8 +31,8 @@ class PrepTests(unittest.TestCase):
 
     def test_morning_event_gets_evening_before_when_window_tight(self):
         ev = event('2026-11-13T08:30:00+01:00', '2026-11-13T09:00:00+01:00')
-        self.assertIsInstance(due("2026-11-12T20:00:00+01:00", ev, lead_hours=6), PrepDue)
-        self.assertIsNone(due('2026-11-12T19:00:00+01:00', ev, lead_hours=6))
+        self.assertIsInstance(due("2026-11-12T20:00:00+01:00", ev, config=PrepConfig(lead_hours=6)), PrepDue)
+        self.assertIsNone(due('2026-11-12T19:00:00+01:00', ev, config=PrepConfig(lead_hours=6)))
 
     def test_identity_ignores_rsvp_but_not_reschedule(self):
         key = due('2026-11-13T09:00:00+01:00').identity
@@ -51,10 +51,23 @@ class PrepTests(unittest.TestCase):
         self.assertIsNone(qualifies(event(end='2026-11-13T14:05:00+01:00'), OWN))
 
     def test_reasons(self):
-        self.assertEqual(qualifies(event(summary='Austausch'), OWN), 'outside_attendees')
-        self.assertEqual(qualifies(event(summary='Gym', attendees=[]), OWN, important=['gym']), 'owner_named_topic')
+        self.assertIsNone(qualifies(event(summary='Austausch'), OWN))  # default: outside attendees alone do not qualify
+        self.assertEqual(qualifies(event(summary='Austausch'), OWN, PrepConfig(outside_attendees_qualify=True)), 'outside_attendees')
+        self.assertEqual(qualifies(event(summary='Gym', attendees=[]), OWN, PrepConfig(important_terms=('gym',))), 'owner_named_topic')
         self.assertIsNone(qualifies(event(summary='Austausch', attendees=[]), OWN))
         self.assertEqual(qualifies(event(summary='Pre-Seed Session'), OWN), 'important_title')
+
+    def test_owner_named_event_bypasses_defaults(self):
+        short = event(summary='Blocker Vorschlag', end='2026-11-13T14:05:00+01:00')
+        self.assertIsNone(qualifies(short, OWN))
+        self.assertEqual(qualifies(short, OWN, PrepConfig(important_event_ids=('e1',))), 'owner_named_event')
+        self.assertEqual(qualifies(short, OWN, PrepConfig(important_terms=('vorschlag',))), 'owner_named_topic')
+        cancelled = dict(short, status='cancelled')
+        self.assertIsNone(qualifies(cancelled, OWN, PrepConfig(important_event_ids=('e1',))))
+
+    def test_defaults_are_distinguishable_from_owner_settings(self):
+        cfg = PrepConfig(lead_hours=24, owner_set=frozenset({'lead_hours'}))
+        self.assertEqual((cfg.source('lead_hours'), cfg.source('quiet_start')), ('owner', 'default'))
 
     def test_missed_window_is_explicit_not_delivered(self):
         result = due('2026-11-13T13:00:00+01:00', max_delay_seconds=600)

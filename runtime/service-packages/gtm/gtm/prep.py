@@ -28,6 +28,30 @@ MIN_MINUTES, MAX_MINUTES = 20, 8 * 60
 
 
 @dataclass(frozen=True)
+class PrepConfig:
+    """Preparation policy. Every value is a design default until `owner_set`
+    names it; `owner_set` records which fields Ole actually chose.
+
+    Outside-attendee events do not qualify by default, because most are not
+    worth a note. Events Ole names (terms or event ids) always qualify and
+    bypass the duration and routine-title filters.
+    """
+    lead_hours: int = 18
+    quiet_start: time = QUIET_START
+    quiet_end: time = QUIET_END
+    evening_slot: time = time(20, 0)
+    min_minutes: int = MIN_MINUTES
+    max_minutes: int = MAX_MINUTES
+    outside_attendees_qualify: bool = False
+    important_terms: tuple = ()
+    important_event_ids: tuple = ()
+    owner_set: frozenset = frozenset()
+
+    def source(self, name):
+        return 'owner' if name in self.owner_set else 'default'
+
+
+@dataclass(frozen=True)
 class PrepDue:
     identity: str
     event_id: str
@@ -54,50 +78,56 @@ def outside_attendees(event, own_addresses):
         and a.get('responseStatus') != 'declined' and a['email'].casefold() not in own}))
 
 
-def qualifies(event, own_addresses, important=()):
-    """Return the reason this event needs preparation, or None."""
+def qualifies(event, own_addresses, config=None):
+    """Return the reason this event needs preparation, or None.
+
+    Owner-named events win over the generic filters; the generic filters
+    (duration, routine titles, outside attendees) only shape the defaults.
+    """
+    config = config or PrepConfig()
     if event.get('status') == 'cancelled' or 'dateTime' not in event.get('start', {}) \
             or 'dateTime' not in event.get('end', {}):
         return None
     if any(a.get('self') and a.get('responseStatus') == 'declined' for a in event.get('attendees', [])):
         return None
-    minutes = (_stamp(event['end']['dateTime']) - _stamp(event['start']['dateTime'])).total_seconds() / 60
-    if not MIN_MINUTES <= minutes <= MAX_MINUTES:
-        return None
     title = str(event.get('summary') or '')
-    if ROUTINE.search(title):
-        return None
-    if any(str(term).casefold() in title.casefold() for term in important if str(term).strip()):
+    if event.get('id') in config.important_event_ids:
+        return 'owner_named_event'
+    if any(str(t).strip() and str(t).casefold() in title.casefold() for t in config.important_terms):
         return 'owner_named_topic'
+    minutes = (_stamp(event['end']['dateTime']) - _stamp(event['start']['dateTime'])).total_seconds() / 60
+    if not config.min_minutes <= minutes <= config.max_minutes or ROUTINE.search(title):
+        return None
     if IMPORTANT.search(title):
         return 'important_title'
-    if outside_attendees(event, own_addresses):
+    if config.outside_attendees_qualify and outside_attendees(event, own_addresses):
         return 'outside_attendees'
     return None
 
 
-def _delivery_time(due, tz):
+def _delivery_time(due, tz, config):
     """Move a due time out of quiet hours: forward to the morning, never into the night."""
     local = due.astimezone(tz)
-    if QUIET_END <= local.time() < QUIET_START:
+    if config.quiet_end <= local.time() < config.quiet_start:
         return due
-    day = local.date() if local.time() < QUIET_END else local.date() + timedelta(days=1)
-    return datetime.combine(day, QUIET_END, tz).astimezone(timezone.utc)
+    day = local.date() if local.time() < config.quiet_end else local.date() + timedelta(days=1)
+    return datetime.combine(day, config.quiet_end, tz).astimezone(timezone.utc)
 
 
-def due_preparation(event, *, calendar_id, own_addresses, now, important=(), lead_hours=18,
-                    max_delay_seconds=None, tz='Europe/Berlin', min_lead_minutes=30):
+def due_preparation(event, *, calendar_id, own_addresses, now, config=None, max_delay_seconds=None,
+                    tz='Europe/Berlin', min_lead_minutes=30):
     """PrepDue when the preparation window is open, a missed-state dict when
     delivery is too late to be useful, otherwise None.
 
     Identity is bound to calendar, event and real start, so RSVP or etag changes
     never repeat a note while a reschedule gets a fresh one.
     """
-    if not isinstance(lead_hours, int) or isinstance(lead_hours, bool) or not 2 <= lead_hours <= 72:
+    config = config or PrepConfig()
+    if not isinstance(config.lead_hours, int) or isinstance(config.lead_hours, bool) or not 2 <= config.lead_hours <= 72:
         raise ValueError('prep_lead_out_of_range')
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError('Explicit clock timezone required')
-    reason = qualifies(event, own_addresses, important)
+    reason = qualifies(event, own_addresses, config)
     if reason is None:
         return None
     if not event.get('id') or not calendar_id:
@@ -105,14 +135,14 @@ def due_preparation(event, *, calendar_id, own_addresses, now, important=(), lea
     zone = ZoneInfo(tz)
     starts = _stamp(event['start']['dateTime']); clock = now.astimezone(timezone.utc)
     latest = starts - timedelta(minutes=min_lead_minutes)
-    due = _delivery_time(starts - timedelta(hours=lead_hours), zone)
-    if due >= latest:  # window too tight after quiet hours: latest 20:00 local before the start
+    due = _delivery_time(starts - timedelta(hours=config.lead_hours), zone, config)
+    if due >= latest:  # window too tight after quiet hours: latest evening slot before the start
         local = latest.astimezone(zone)
-        day = local.date() if local.time() >= time(20, 0) else local.date() - timedelta(days=1)
-        due = datetime.combine(day, time(20, 0), zone).astimezone(timezone.utc)
+        day = local.date() if local.time() >= config.evening_slot else local.date() - timedelta(days=1)
+        due = datetime.combine(day, config.evening_slot, zone).astimezone(timezone.utc)
     if clock < due or clock >= latest:
         return None
-    if not QUIET_END <= clock.astimezone(zone).time() < QUIET_START:
+    if not config.quiet_end <= clock.astimezone(zone).time() < config.quiet_start:
         return None  # catch-up after a restart waits for the morning, never pings at night
     delay = int((clock - due).total_seconds())
     key = hashlib.sha256(json.dumps([calendar_id, event['id'], starts.isoformat(), 'prep'],
