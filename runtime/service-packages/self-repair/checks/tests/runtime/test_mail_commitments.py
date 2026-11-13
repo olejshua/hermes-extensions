@@ -11,7 +11,7 @@ BODY = 'Hallo Anna,\nich schicke dir das Angebot bis 20.11.2026.\nIch melde mich
 
 
 def source(**kw):
-    base = dict(message_id='m1', thread_id='t1', sender=OWNER, sent_at='2026-11-13T09:00:00+01:00',
+    base = dict(message_id='m1', thread_id='t1', from_header=OWNER, labels=('SENT',), mailbox_account=OWNER, sent_at='2026-11-13T09:00:00+01:00',
                 body=BODY, thread_complete=True)
     base.update(kw)
     return MailSource(**base)
@@ -47,11 +47,24 @@ class T(unittest.TestCase):
 
     def test_foreign_sender_is_refused(self):
         with self.assertRaises(ValueError):
-            self.rec(source(sender='anna@example.invalid'), [MailCommitment('a', 'x', 'Ich melde mich am Montag')])
+            self.rec(source(from_header='anna@example.invalid'), [MailCommitment('a', 'x', 'Ich melde mich am Montag')])
 
-    def test_sender_display_text_does_not_match(self):
-        with self.assertRaises(ValueError):
-            self.rec(source(sender=f'Owner <x@example.invalid> {OWNER}'), [MailCommitment('a', 'x', 'Ich melde mich am Montag')])
+    def test_valid_display_name_owner_mail_is_accepted(self):
+        for header in (f'Ole Beispiel <{OWNER}>', f'"Beispiel, Ole" <{OWNER.upper()}>'):
+            self.assertEqual(len(self.rec(source(message_id=header[:5] + str(len(header))), [MailCommitment('a', 'x', 'Ich melde mich am Montag')])), 1)
+
+    def test_ambiguous_or_spoofed_header_is_refused(self):
+        for header in (f'Owner <x@example.invalid> {OWNER}', f'{OWNER}, anna@example.invalid',
+                       f'"{OWNER}" <anna@example.invalid>', f'Ole <{OWNER}>\nBcc: a@b.invalid'):
+            with self.assertRaises(ValueError, msg=header):
+                self.rec(source(from_header=header), [MailCommitment('a', 'x', 'Ich melde mich am Montag')])
+
+    def test_header_alone_is_not_provenance(self):
+        item = [MailCommitment('a', 'x', 'Ich melde mich am Montag')]
+        for kw in (dict(labels=()), dict(labels=('INBOX',)), dict(labels=('SENT', 'DRAFT')),
+                   dict(mailbox_account='other@example.invalid'), dict(mailbox_account='')):
+            with self.assertRaises(ValueError, msg=str(kw)):
+                self.rec(source(**kw), item)
 
     def test_invented_quote_refused(self):
         with self.assertRaises(ValueError):
