@@ -1,6 +1,6 @@
 """Real-source adapters for prep_daemon, reusing the installed helpers.
 
-Reads only. The mail collector searches only the attendee addresses of the
+Reads only. TwentyEvidence adds CRM facts when 'twenty' is allowed. The mail collector searches only the attendee addresses of the
 event in the owner's own mailbox and only when 'mail' is an allowed source.
 The sender reuses the existing private-chat CLI path and receipt format.
 """
@@ -64,6 +64,80 @@ class MailEvidence:
                 # snippet is a Message field the metadata format documents loosely: treat it as optional.
                 text = _CONTROL.sub(' ', f"{headers.get('date', '')[:16]} {headers.get('subject', '')}: {msg.get('snippet') or ''}").strip()
                 items.append(dict(source='mail', ref='mail:' + msg['id'], text=text))
+        return items
+
+
+class TwentyEvidence:
+    """Read-only CRM facts for the event's outside attendees, only when 'twenty' is allowed.
+
+    A person counts only if an exact attendee address is on the returned record,
+    so a filter that matches loosely cannot attach someone else's facts. Truncated
+    result pages are skipped, not guessed. CRM text is data: control characters are
+    stripped and length is bounded. The filter shape is the standard Twenty one and
+    has not been run against the live server.
+    """
+    PERSON = ('query($filter:PersonFilterInput!){people(first:5,filter:$filter){pageInfo{hasNextPage} '
+              'edges{node{id companyId name{firstName lastName} jobTitle emails{primaryEmail additionalEmails} '
+              'company{name}}}}}')
+    OPPORTUNITIES = ('query($filter:OpportunityFilterInput!){opportunities(first:5,filter:$filter){pageInfo{hasNextPage} '
+                     'edges{node{id name stage closeDate}}}}')
+
+    def __init__(self, client, own=(CODE,)):
+        self.client, self.own = client, {a.casefold() for a in own}
+
+    @staticmethod
+    def _clean(value, limit=120):
+        return _CONTROL.sub(' ', str(value or '')).strip()[:limit]
+
+    def collect(self, event, allowed):
+        if 'twenty' not in {a.casefold() for a in allowed}:
+            return []
+        addresses = sorted({a['email'].casefold() for a in event.get('attendees', [])
+                            if a.get('email') and not a.get('self') and not a.get('resource')
+                            and a['email'].casefold() not in self.own and _ADDRESS.fullmatch(a['email'])})
+        items, seen_companies = [], set()
+        for address in addresses[:6]:
+            found = self.client.query(self.PERSON, {'filter': {'emails': {'primaryEmail': {'eq': address}}}})['people']
+            if found.get('pageInfo', {}).get('hasNextPage'):
+                continue
+            for row in found.get('edges', []):
+                person = row['node']
+                mail = person.get('emails') or {}
+                have = {str(mail.get('primaryEmail') or '').casefold(), *[str(e).casefold() for e in mail.get('additionalEmails') or []]}
+                if address not in have:
+                    continue
+                name = ' '.join(filter(None, ((person.get('name') or {}).get('firstName'), (person.get('name') or {}).get('lastName'))))
+                company = (person.get('company') or {}).get('name')
+                text = self._clean(f"CRM: {name}" + (f", {person['jobTitle']}" if person.get('jobTitle') else '') +
+                                   (f" bei {company}" if company else ''))
+                items.append(dict(source='twenty', ref='twenty:person:' + str(person['id']), text=text))
+                cid = person.get('companyId')
+                if cid and cid not in seen_companies:
+                    seen_companies.add(cid)
+                    opps = self.client.query(self.OPPORTUNITIES, {'filter': {'companyId': {'eq': cid}}})['opportunities']
+                    if opps.get('pageInfo', {}).get('hasNextPage'):
+                        continue
+                    for o in opps.get('edges', []):
+                        node = o['node']
+                        items.append(dict(source='twenty', ref='twenty:opportunity:' + str(node['id']),
+                                          text=self._clean(f"CRM-Chance {node.get('name')}: Stufe {node.get('stage')}")))
+        return items
+
+
+class CombinedEvidence:
+    """Several permitted collectors behind the one collect() the daemon expects.
+
+    Any collector failure propagates so the daemon's existing source-failure
+    degradation applies; a partial note is never presented as complete.
+    """
+
+    def __init__(self, *collectors):
+        self.collectors = collectors
+
+    def collect(self, event, allowed):
+        items = []
+        for collector in self.collectors:
+            items.extend(collector.collect(event, allowed))
         return items
 
 
