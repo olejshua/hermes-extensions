@@ -195,7 +195,7 @@ def extract_mail_commitments(owner_address, source: MailSource, complete=None, m
         return dict(status='model_error', planned=[], review=[], rejected=0, error=type(exc).__name__)
     if data is None or not isinstance(data.get('items'), list):
         return dict(status='unparseable', planned=[], review=[], rejected=0)
-    planned, review = [], []
+    planned, review, accepted = [], [], []
     seen = set()
     for raw in data['items']:
         try:
@@ -205,9 +205,10 @@ def extract_mail_commitments(owner_address, source: MailSource, complete=None, m
                 raise ValueError('duplicate key')
             seen.add(item.key)
             planned.extend(plan_mail_commitments(owner_address, source, [item]))
+            accepted.append(dict(key=item.key, quote=item.quote))
         except (KeyError, TypeError, ValueError) as exc:
             review.append(dict(item=raw if isinstance(raw, dict) else None, reason=str(exc)[:120]))
     status = 'ready' if planned else ('review' if review else 'abstained')
     if mode == 'dry_run':
-        return dict(status='dry_run_' + status, planned=planned, review=review, rejected=len(review))
-    return dict(status=status, planned=planned, review=review, rejected=len(review))
+        return dict(status='dry_run_' + status, planned=planned, review=review, rejected=len(review), items=accepted)
+    return dict(status=status, planned=planned, review=review, rejected=len(review), items=accepted)
