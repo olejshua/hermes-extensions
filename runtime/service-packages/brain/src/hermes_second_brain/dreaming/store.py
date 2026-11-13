@@ -268,7 +268,8 @@ _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("insights", "deep_rationale", "TEXT NOT NULL DEFAULT ''"),
     ("insights", "reflection_json", "TEXT NOT NULL DEFAULT '{}'"),
     ("reports", "reflection_attempt_json", "TEXT NOT NULL DEFAULT ''"),
-    ("reports", "delivery_receipt_json", "TEXT NOT NULL DEFAULT ''"),
+    ("reports", "delivery_state", "TEXT NOT NULL DEFAULT ''"),
+    ("reports", "report_attempt_json", "TEXT NOT NULL DEFAULT ''"),
     ("publications", "indexable", "INTEGER NOT NULL DEFAULT 0"),
     ("publications", "synced_at", "REAL"),
     ("publications", "sync_evidence_hash", "TEXT NOT NULL DEFAULT ''"),
@@ -480,6 +481,12 @@ class DreamStore:
                 continue
             if column not in columns:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        # Delivery truth: rows marked delivered before receipts existed (stdout hand-off) are
+        # legacy_unverified, never confirmed. delivered_at stays so legacy consumers and dedupe keep working.
+        conn.execute("UPDATE reports SET delivery_state='legacy_unverified' WHERE delivered_at IS NOT NULL "
+                     "AND delivery_state='' AND reflection_attempt_json='' AND report_attempt_json=''")
+        conn.execute("UPDATE reports SET delivery_state='confirmed' WHERE delivered_at IS NOT NULL AND delivery_state='' "
+                     "AND reflection_attempt_json LIKE '%\"state\": \"delivered\"%'")
         # Version 5 names the local filesystem outcome honestly.  It is not an
         # acknowledgement from OpenViking and therefore cannot mean synced.
         conn.execute(
@@ -1447,41 +1454,77 @@ class DreamStore:
                     return False
                 attempt.update(state="delivered", receipt=native_receipt)
                 conn.execute("UPDATE reports SET reflection_attempt_json=? WHERE report_id=?", (json.dumps(attempt,sort_keys=True),report_id))
+            if not row["reflection_attempt_json"]:
+                row_attempt = conn.execute("SELECT report_attempt_json FROM reports WHERE report_id=?", (report_id,)).fetchone()[0]
+                if row_attempt:
+                    return False  # An attempted native send must be completed with its receipt, never plain-acked.
+            state = "confirmed" if row["reflection_attempt_json"] else "legacy_unverified"
             cursor = conn.execute(
-                "UPDATE reports SET delivered_at=? WHERE report_id=? AND claim_owner=? "
+                "UPDATE reports SET delivered_at=?, delivery_state=? WHERE report_id=? AND claim_owner=? "
                 "AND claimed_at IS NOT NULL AND delivered_at IS NULL AND superseded_at IS NULL",
-                (stamp, report_id, owner),
+                (stamp, state, report_id, owner),
             )
             return cursor.rowcount == 1
 
-    def ack_report_receipt(self, report_id: str, owner: str, receipt: dict[str, Any], *, now: float | None = None) -> bool:
-        """Mark a plain stored report delivered only with a native send receipt (success, numeric message id).
-
-        Reflection claims keep their own attempt-bound receipt path in ack_report."""
-        if (not isinstance(receipt, dict) or receipt.get("success") is not True
-                or not str(receipt.get("message_id") or "").isdigit() or int(receipt["message_id"]) <= 0
-                or receipt.get("error") or receipt.get("skipped") is True or receipt.get("partial_success") is True):
-            return False
-        stamp = time.time() if now is None else now
-        kept = {k: receipt[k] for k in ("success", "message_id", "platform") if k in receipt}
-        kept["message_id"] = str(kept["message_id"])
+    def begin_report_attempt(self, report_id: str, owner: str, attempt: dict[str, Any]) -> bool:
+        """Fence one native send of a plain stored report. Never replayed once recorded."""
         with self.transaction() as conn:
-            row = conn.execute("SELECT reflection_attempt_json,delivery_snapshot FROM reports WHERE report_id=? AND claim_owner=? "
+            row = conn.execute("SELECT * FROM reports WHERE report_id=? AND claim_owner=? AND claimed_at IS NOT NULL "
                                "AND delivered_at IS NULL AND superseded_at IS NULL", (report_id, owner)).fetchone()
-            if row is None or row["reflection_attempt_json"]:
+            if (row is None or row["report_attempt_json"] or row["reflection_attempt_json"]
+                    or attempt.get("report_id") != report_id or attempt.get("fingerprint") != row["fingerprint"]):
                 return False
-            if row["delivery_snapshot"] and _reflection_snapshot_items(json.loads(row["delivery_snapshot"])):
+            conn.execute("UPDATE reports SET report_attempt_json=? WHERE report_id=?", (json.dumps(attempt, sort_keys=True), report_id))
+            return True
+
+    def finish_report_attempt(self, report_id: str, attempt_id: str, state: str) -> bool:
+        """Record a non-delivered outcome (failed/unknown). The attempt row stays, so no automatic replay."""
+        with self.transaction() as conn:
+            row = conn.execute("SELECT report_attempt_json FROM reports WHERE report_id=? AND delivered_at IS NULL", (report_id,)).fetchone()
+            if row is None or not row[0]:
                 return False
-            cursor = conn.execute("UPDATE reports SET delivered_at=?, delivery_receipt_json=? WHERE report_id=? AND claim_owner=? "
-                                  "AND claimed_at IS NOT NULL AND delivered_at IS NULL AND superseded_at IS NULL",
-                                  (stamp, json.dumps(kept, sort_keys=True), report_id, owner))
+            attempt = json.loads(row[0])
+            if attempt.get("attempt_id") != attempt_id or attempt.get("state") != "attempted" or state not in ("failed", "unknown"):
+                return False
+            attempt["state"] = state
+            conn.execute("UPDATE reports SET report_attempt_json=? WHERE report_id=?", (json.dumps(attempt, sort_keys=True), report_id))
+            return True
+
+    def ack_report_receipt(self, report_id: str, owner: str, receipt: dict[str, Any], *, now: float | None = None) -> bool:
+        """Confirm delivery only against the recorded attempt: the receipt must carry that attempt's id,
+        argument hash, target hash, platform and report id, plus success and a positive numeric message id."""
+        stamp = time.time() if now is None else now
+        with self.transaction() as conn:
+            row = conn.execute("SELECT report_attempt_json FROM reports WHERE report_id=? AND claim_owner=? AND claimed_at IS NOT NULL "
+                               "AND delivered_at IS NULL AND superseded_at IS NULL", (report_id, owner)).fetchone()
+            if row is None or not row[0]:
+                return False
+            attempt = json.loads(row[0])
+            if (attempt.get("state") != "attempted" or not isinstance(receipt, dict) or receipt.get("success") is not True
+                    or not str(receipt.get("message_id") or "").isdigit() or int(receipt["message_id"]) <= 0
+                    or receipt.get("error") or receipt.get("skipped") is True or receipt.get("partial_success") is True
+                    or any(receipt.get(k) != attempt.get(k) for k in
+                           ("attempt_id", "arguments_sha256", "target_sha256", "platform", "report_id"))):
+                return False
+            attempt.update(state="delivered", receipt={k: receipt[k] for k in
+                           ("success", "message_id", "attempt_id", "arguments_sha256", "target_sha256", "platform", "report_id")})
+            cursor = conn.execute("UPDATE reports SET delivered_at=?, delivery_state='confirmed', report_attempt_json=? "
+                                  "WHERE report_id=? AND claim_owner=? AND delivered_at IS NULL",
+                                  (stamp, json.dumps(attempt, sort_keys=True), report_id, owner))
             return cursor.rowcount == 1
 
-    def reports_delivered_without_receipt(self) -> int:
-        """Reports marked delivered with neither a send receipt nor a reflection attempt receipt."""
+    def report_delivery_counts(self) -> dict[str, int]:
+        """Metadata-only: confirmed (bound native receipt), legacy_unverified (stdout/plain ack), attempt_unknown."""
         with self.transaction() as conn:
-            return int(conn.execute("SELECT count(*) FROM reports WHERE delivered_at IS NOT NULL AND delivery_receipt_json='' "
-                                    "AND reflection_attempt_json='' AND superseded_at IS NULL").fetchone()[0])
+            rows = conn.execute("SELECT delivery_state, report_attempt_json FROM reports WHERE superseded_at IS NULL "
+                                "AND (delivered_at IS NOT NULL OR report_attempt_json<>'')").fetchall()
+        out = {"confirmed": 0, "legacy_unverified": 0, "attempt_unknown": 0}
+        for r in rows:
+            if r["delivery_state"] in ("confirmed", "legacy_unverified"):
+                out[r["delivery_state"]] += 1
+            elif r["report_attempt_json"]:
+                out["attempt_unknown"] += 1
+        return out
 
     def begin_reflection_attempt(self, report_id: str, owner: str, attempt: dict[str, Any]) -> bool:
         """Fence an irreversible single transport attempt in the existing report."""
