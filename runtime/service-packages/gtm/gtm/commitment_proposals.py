@@ -14,7 +14,7 @@ import re
 import sqlite3
 from pathlib import Path
 
-from gtm.gmail_mail_source import thread_sources
+from gtm.gmail_mail_source import thread_sources, thread_fingerprint
 from gtm.mail_commitments import MailSource, plan_mail_commitments, MailCommitment
 from gtm.synthesis import extract_mail_commitments
 
@@ -101,15 +101,39 @@ class ProposalStore:
             db.close()
 
 
-def confirm(proposals: ProposalStore, commitments, ref, *, current_thread_hash, acknowledge_flags=False):
-    """Owner action. Refuses a stale thread; flagged proposals need an explicit acknowledgement."""
+def proposal_version(row):
+    """Binds a confirmation to the exact proposal content, flags and thread state."""
+    blob = '\x1f'.join(str(row[k]) for k in ('ref', 'title', 'quote', 'due', 'flags', 'thread_hash'))
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def confirmation_phrase(row):
+    """What the owner sends on the verified owner channel. Flagged items need the explicit tail."""
+    base = f"Bestätige {hashlib.sha256(row['ref'].encode()).hexdigest()[:8]} {proposal_version(row)[:10]}"
+    return base + (' trotz Hinweisen' if row['flags'] else '')
+
+
+def confirm_from_owner_message(proposals: ProposalStore, commitments, service, owner_address, *, ref, message_id,
+                               lookup, owner_handle):
+    """Commit a proposal only on authenticated owner-channel intent.
+
+    `lookup(message_id)` is the trusted channel record reader and returns {'from': handle, 'body': text, 'kind': 'message'}.
+    The sender must be the verified owner handle, the text must be exactly the phrase bound to this
+    proposal's version and flags (so an old, edited or other proposal's confirmation does not match),
+    and the current full thread (inbound included) is re-read and must match the proposal's thread
+    digest. Anything stale or unknown stays pending. A model, a file or a flag argument cannot confirm.
+    """
     row = next((r for r in proposals.pending() if r['ref'] == ref), None)
     if row is None:
         raise ValueError('no_pending_proposal')
-    if row['thread_hash'] != current_thread_hash:
+    record = lookup(message_id)
+    if (not isinstance(record, dict) or record.get('kind', 'message') != 'message' or record.get('from') != owner_handle
+            or not isinstance(record.get('body'), str) or record['body'].strip() != confirmation_phrase(row)):
+        raise ValueError('owner_confirmation_not_bound_to_this_proposal')
+    thread_id = ref.split(':')[1]
+    now, _count = thread_fingerprint(service, owner_address, thread_id)  # raises on unreadable: stays review
+    if now != row['thread_hash']:
         raise ValueError('thread_changed_since_proposal')
-    if row['flags'] and not acknowledge_flags:
-        raise ValueError('flagged_proposal_needs_acknowledgement')
     commitments.add(row['title'], row['ref'], row['due'], 'date' if row['due'] else 'time')
     proposals.decide(ref, 'confirmed')
 
@@ -123,10 +147,10 @@ def propose_from_thread(service, owner_address, thread_id, proposals: ProposalSt
     if mode == 'off' or complete is None:
         return dict(status='disabled', proposed=0)
     sources, gaps = thread_sources(service, owner_address, thread_id)
-    digest = thread_hash((sources, gaps))
-    report = dict(status='ok', proposed=0, gaps=gaps, flagged=0, thread_hash=digest, results=[])
     if gaps:
-        report['status'] = 'incomplete_thread'; return report
+        return dict(status='incomplete_thread', proposed=0, gaps=gaps, flagged=0, results=[])
+    digest, _count = thread_fingerprint(service, owner_address, thread_id)
+    report = dict(status='ok', proposed=0, gaps=gaps, flagged=0, thread_hash=digest, results=[])
     for index, source in enumerate(sources):
         result = extract_mail_commitments(owner_address, source, complete, mode,
                                           transmission_approved=transmission_approved, ledger=ledger, scope=scope)

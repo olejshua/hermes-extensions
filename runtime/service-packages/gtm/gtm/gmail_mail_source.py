@@ -9,6 +9,8 @@ an inserted message can carry SENT; both stay a documented residual risk.
 from __future__ import annotations
 import base64
 import datetime as dt
+import hashlib
+import json
 
 from gtm.mail_commitments import MailSource, bare_address
 
@@ -79,3 +81,25 @@ def thread_sources(service, owner_address, thread_id):
     complete = not gaps
     sources = [MailSource(**{**s.__dict__, 'thread_complete': complete}) for s in sources]
     return sources, gaps
+
+
+def thread_fingerprint(service, owner_address, thread_id):
+    """Digest of the whole current thread, inbound included: ids, internalDate, labels and body
+    (or the full payload when there is no text body). A newer recipient reply, a label change or an
+    edited body changes it. Returns (digest, message_count). Unreadable thread raises, so unknown
+    coverage can never look unchanged."""
+    verified_profile(service, owner_address)
+    thread = service.users().threads().get(userId='me', id=thread_id, format='full').execute()
+    messages = thread.get('messages')
+    if thread.get('id') != thread_id or not isinstance(messages, list) or not messages:
+        raise MailSourceError('thread_unreadable')
+    rows = []
+    for msg in messages:
+        if not isinstance(msg, dict) or not msg.get('id') or not str(msg.get('internalDate', '')).isdigit():
+            raise MailSourceError('thread_message_unreadable')
+        body = _text(msg.get('payload'))
+        content = body if body is not None else json.dumps(msg.get('payload'), sort_keys=True, default=str)
+        rows.append([msg['id'], str(msg['internalDate']), sorted(str(x) for x in msg.get('labelIds') or ()),
+                     hashlib.sha256(content.encode()).hexdigest()])
+    rows.sort()
+    return hashlib.sha256(json.dumps(rows).encode()).hexdigest(), len(rows)
