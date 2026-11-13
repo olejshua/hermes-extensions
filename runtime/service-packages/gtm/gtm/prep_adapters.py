@@ -14,7 +14,8 @@ from gtm.briefing_daemon import (CLI, CODE, DESTINATION, ExistingReads, ReviewRe
 from gtm.calendar.routing import event_calendar
 from gtm.prep_daemon import PrepStore
 
-_ADDRESS = re.compile(r'^[A-Za-z0-9.!#$%&*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$')
+_ADDRESS = re.compile(r'^[A-Za-z0-9._%+][A-Za-z0-9._%+-]*@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$')
+_CONTROL = re.compile(r'[\x00-\x1f\x7f]+')
 HORIZON_HOURS = 74
 
 
@@ -43,18 +44,25 @@ class MailEvidence:
         if 'mail' not in {a.casefold() for a in allowed}:
             return []
         svc = self.reads.mail_module.service('code')
+        getter = getattr(self.reads.mail_module, 'verified_profile', None)
+        actual = getter(svc) if callable(getter) else None
+        if actual is None:
+            actual = svc.users().getProfile(userId='me').execute().get('emailAddress', '')
+        if not isinstance(actual, str) or actual.casefold() != CODE.casefold():
+            raise ReviewRequired('mailbox_identity_mismatch')
         addresses = sorted({a['email'].casefold() for a in event.get('attendees', [])
                             if a.get('email') and not a.get('self') and not a.get('resource')
                             and a['email'].casefold() not in self.own and _ADDRESS.fullmatch(a['email'])})
         items = []
         for address in addresses[:6]:
-            listing = svc.users().messages().list(userId='me', q=f'from:{address} OR to:{address}',
+            listing = svc.users().messages().list(userId='me', q=f'(from:{address} OR to:{address}) newer_than:90d',
                                                   maxResults=self.per_address).execute()
             for ref in listing.get('messages', []):
                 msg = svc.users().messages().get(userId='me', id=ref['id'], format='metadata',
                                                  metadataHeaders=['Subject', 'Date']).execute()
                 headers = {h['name'].lower(): h['value'] for h in msg.get('payload', {}).get('headers', [])}
-                text = f"{headers.get('date', '')[:16]} {headers.get('subject', '')}: {msg.get('snippet', '')}".strip()
+                # snippet is a Message field the metadata format documents loosely: treat it as optional.
+                text = _CONTROL.sub(' ', f"{headers.get('date', '')[:16]} {headers.get('subject', '')}: {msg.get('snippet') or ''}").strip()
                 items.append(dict(source='mail', ref='mail:' + msg['id'], text=text))
         return items
 

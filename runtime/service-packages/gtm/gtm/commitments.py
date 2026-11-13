@@ -20,6 +20,8 @@ class CommitmentStore:
         with self.connect() as db:
             db.execute('CREATE TABLE IF NOT EXISTS commitment(id INTEGER PRIMARY KEY, text TEXT NOT NULL, ref TEXT NOT NULL UNIQUE, '
                        'due TEXT, state TEXT NOT NULL DEFAULT "open", last_reminder_receipt TEXT, last_reminded REAL)')
+            db.execute('CREATE TABLE IF NOT EXISTS digest(id INTEGER PRIMARY KEY, refs TEXT NOT NULL, message TEXT NOT NULL, '
+                       'state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, receipt TEXT, updated REAL NOT NULL)')
         self.path.chmod(0o600)
 
     @contextmanager
@@ -52,6 +54,12 @@ class CommitmentStore:
                 rows.append(dict(row))
         return sorted(rows, key=lambda r: r['due'])
 
+    def mark_uncertain(self, refs, now):
+        """Cooldown without a receipt: the reminder may have gone out, so do not resend now."""
+        with self.connect() as db:
+            for ref in refs:
+                db.execute('UPDATE commitment SET last_reminded=? WHERE ref=?', (now.timestamp(), ref))
+
     def mark_reminded(self, refs, receipt, now):
         if not receipt: raise ValueError('receipt_required')
         with self.connect() as db:
@@ -68,3 +76,72 @@ def render_digest(rows, now, tz):
         lines.append(f"{row['text']} ({status} {due:%d.%m. %H:%M})")
     head = 'Offene Zusage von dir: ' if len(lines) == 1 else 'Offene Zusagen von dir: '
     return head + '; '.join(lines) + '. Soll ich etwas davon vorbereiten? Nichts davon wurde nach außen geschickt.'
+
+
+RETRY_AFTER_SECONDS = 600
+MAX_ATTEMPTS = 3
+STALE_SECONDS = 300
+
+
+def _claim_digest(store, refs, message, clock):
+    """One digest at a time: nothing starts while another is in flight, uncertain or recently rejected."""
+    import json
+    with store.connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        db.execute("UPDATE digest SET state='delivery_unknown' WHERE state='send_attempted' AND ?-updated>?", (clock, STALE_SECONDS))
+        busy = db.execute("SELECT 1 FROM digest WHERE state='send_attempted' OR (state='delivery_failed' AND (?-updated<? OR attempts>=?))",
+                          (clock, RETRY_AFTER_SECONDS, MAX_ATTEMPTS)).fetchone()
+        if busy:
+            return None
+        for row in db.execute("SELECT refs FROM digest WHERE state IN ('delivered','delivery_unknown') AND ?-updated<?",
+                              (clock, REMIND_EVERY_HOURS * 3600)):
+            if set(json.loads(row['refs'])) & set(refs):
+                return None  # already reminded (or possibly reminded) within the cooldown
+        failed = db.execute("SELECT id, attempts FROM digest WHERE state='delivery_failed' ORDER BY id DESC LIMIT 1").fetchone()
+        attempts = 1
+        if failed:
+            db.execute("UPDATE digest SET state='superseded' WHERE id=?", (failed['id'],))
+            attempts = failed['attempts'] + 1
+        cursor = db.execute("INSERT INTO digest(refs,message,state,attempts,updated) VALUES(?,?,'send_attempted',?,?)",
+                            (json.dumps(refs), message, attempts, clock))
+        return cursor.lastrowid
+
+
+def commitment_tick(store, sender, now, tz, *, activate=False):
+    """Remind the owner of due commitments. Reports planned, sent and delivered separately.
+
+    A reminder counts only after a sender receipt. A rejected send is retried later
+    (bounded). An uncertain send is never replayed: its commitments get a cooldown so
+    they come back tomorrow instead of being sent twice now.
+    """
+    import json
+    rows = store.due_for_reminder(now)
+    report = dict(due=len(rows), attempted=0, delivered=0, rejected=0, unknown=0, dry_run=not activate)
+    message = render_digest(rows, now, tz)
+    if not rows or not activate:
+        report['message'] = message
+        return report
+    clock = now.timestamp(); refs = [r['ref'] for r in rows[:5]]
+    digest = _claim_digest(store, refs, message, clock)
+    if digest is None:
+        return report
+    report['attempted'] = 1
+    try:
+        result = sender.send(f'commitments-{digest}', message)
+    except Exception:
+        result = None
+    with store.connect() as db:
+        if isinstance(result, dict) and result.get('success') is True and result.get('message_id'):
+            db.execute("UPDATE digest SET state='delivered', receipt=?, updated=? WHERE id=?", (str(result['message_id']), clock, digest))
+            report['delivered'] = 1
+        elif isinstance(result, dict) and result.get('success') is False and not result.get('message_id'):
+            db.execute("UPDATE digest SET state='delivery_failed', updated=? WHERE id=? AND state='send_attempted'", (clock, digest))
+            report['rejected'] = 1
+        else:
+            db.execute("UPDATE digest SET state='delivery_unknown', updated=? WHERE id=? AND state='send_attempted'", (clock, digest))
+            report['unknown'] = 1
+    if report['delivered']:
+        store.mark_reminded(refs, str(result['message_id']), now)
+    elif report['unknown']:
+        store.mark_uncertain(refs, now)
+    return report

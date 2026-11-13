@@ -65,14 +65,33 @@ class PrepStore:
                        (due.identity, due.event_id, due.starts_at.isoformat(), 'claimed', clock))
         return True
 
-    def set(self, identity, state, clock, *, message=None, receipt=None, code=None, attempt=False):
+    def begin_send(self, identity, clock):
+        """Atomic rendered -> send_attempted. Only one caller can win, so
+        concurrent ticks or a resumed job never send twice."""
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            changed = db.execute("UPDATE prep SET state='send_attempted', attempts=attempts+1, updated=? "
+                                 "WHERE identity=? AND state IN ('rendered','delivery_failed')", (clock, identity)).rowcount
+        return changed == 1
+
+    def settle_stale(self, clock, max_age=300):
+        """A process that died mid-send left send_attempted behind. The send may or
+        may not have happened, so it becomes unknown and is never replayed."""
+        with self.connect() as db:
+            return db.execute("UPDATE prep SET state='delivery_unknown', code='stale_send_attempt', updated=? "
+                              "WHERE state='send_attempted' AND ?-updated>?", (clock, clock, max_age)).rowcount
+
+    def set(self, identity, state, clock, *, message=None, receipt=None, code=None, attempt=False, only_from=None):
         if receipt is not None and state != 'delivered':
             raise PrepReview('receipt_only_for_delivered')
+        guard = ''
+        args = [state, message, receipt, code, int(attempt), clock, identity]
+        if only_from:
+            guard = ' AND state IN (' + ','.join('?' * len(only_from)) + ')'
+            args += list(only_from)
         with self.connect() as db:
-            db.execute('UPDATE prep SET state=?, message=coalesce(?,message), receipt=coalesce(?,receipt), '
-                       'code=?, attempts=attempts+?, updated=? WHERE identity=?',
-                       (state, message, receipt, code, int(attempt), clock, identity))
-
+            return db.execute('UPDATE prep SET state=?, message=coalesce(?,message), receipt=coalesce(?,receipt), '
+                              'code=?, attempts=attempts+?, updated=? WHERE identity=?' + guard, args).rowcount == 1
 
 def permitted_evidence(items, allowed_sources):
     """Keep only owner-allowed sources with a real reference. Returns (kept, dropped_sources).
@@ -128,6 +147,8 @@ def tick(reads, store, sender, evidence, drafter, *, now, config=None, allowed_s
     report = dict(due=0, rendered=0, delivered=0, failed_delivery=0, unknown_delivery=0, review=0,
                   retried=0, dry_run=not activate, notes=[])
     clock = now.timestamp()
+    if activate:
+        report['stale_settled'] = store.settle_stale(clock)
     for event in reads.events(now):
         try:
             due = due_preparation(event, calendar_id=reads.calendar_id(event), own_addresses=own_addresses,
@@ -156,8 +177,8 @@ def tick(reads, store, sender, evidence, drafter, *, now, config=None, allowed_s
         if not row or row['state'] == 'claimed':
             note = _render(reads, evidence, drafter, event, allowed_sources, tz, report)
             if note is None:
-                store.set(due.identity, 'review_required', clock, code='render_failed'); continue
-            store.set(due.identity, 'rendered', clock, message=note)
+                store.set(due.identity, 'review_required', clock, code='render_failed', only_from=('claimed',)); continue
+            store.set(due.identity, 'rendered', clock, message=note, only_from=('claimed',))
         else:
             note = row['message']
         # Re-read the event before sending: a moved or cancelled meeting must not get a stale note.
@@ -165,25 +186,31 @@ def tick(reads, store, sender, evidence, drafter, *, now, config=None, allowed_s
         again = due_preparation(fresh, calendar_id=due.calendar_id, own_addresses=own_addresses,
                                 now=now, config=config, tz=tz)
         if not hasattr(again, 'identity') or again.identity != due.identity:
-            store.set(due.identity, 'review_required', clock, code='event_changed'); report['review'] += 1; continue
-        store.set(due.identity, 'send_attempted', clock, attempt=True)
+            store.set(due.identity, 'review_required', clock, code='event_changed', only_from=('claimed', 'rendered', 'delivery_failed')); report['review'] += 1; continue
+        if not store.begin_send(due.identity, clock):
+            continue  # another tick owns this send
         try:
             result = sender.send(due.identity, note)
         except Exception:
             result = None
         if isinstance(result, dict) and result.get('success') is True and result.get('message_id'):
-            store.set(due.identity, 'delivered', clock, receipt=str(result['message_id'])); report['delivered'] += 1
+            store.set(due.identity, 'delivered', clock, receipt=str(result['message_id']), only_from=('send_attempted', 'delivery_unknown')); report['delivered'] += 1
         elif isinstance(result, dict) and result.get('success') is False and not result.get('message_id'):
-            store.set(due.identity, 'delivery_failed', clock, code='send_rejected'); report['failed_delivery'] += 1
+            store.set(due.identity, 'delivery_failed', clock, code='send_rejected', only_from=('send_attempted',)); report['failed_delivery'] += 1
         else:
-            store.set(due.identity, 'delivery_unknown', clock, code='no_receipt'); report['unknown_delivery'] += 1
+            store.set(due.identity, 'delivery_unknown', clock, code='no_receipt', only_from=('send_attempted',)); report['unknown_delivery'] += 1
     return report
 
 
 def _render(reads, evidence, drafter, event, allowed_sources, tz, report):
     try:
-        items, dropped = permitted_evidence(evidence.collect(event, tuple(allowed_sources)), allowed_sources)
-        gaps = ['Keine freigegebene Quelle lieferte Kontext.'] if not items else []
+        try:
+            raw, failed = evidence.collect(event, tuple(allowed_sources)), False
+        except Exception:  # source rejected or unreachable: say so, still prepare from the calendar
+            raw, failed = [], True
+        items, dropped = permitted_evidence(raw, allowed_sources)
+        gaps = ['Eine freigegebene Quelle war nicht erreichbar.'] if failed else (
+            ['Keine freigegebene Quelle lieferte Kontext.'] if not items else [])
         if dropped:
             gaps.append('Nicht freigegebene Quellen wurden nicht verwendet: ' + ', '.join(dropped) + '.')
         note = prepare_note(event, items, drafter, gaps, tz)

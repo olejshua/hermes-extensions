@@ -29,8 +29,10 @@ MIN_MINUTES, MAX_MINUTES = 20, 8 * 60
 
 @dataclass(frozen=True)
 class PrepConfig:
-    """Preparation policy. Every value is a design default until `owner_set`
-    names it; `owner_set` records which fields Ole actually chose.
+    """Preparation policy. Every value is a design default unless `configured`
+    names it. `configured` only records that a local settings file supplied
+    the field. It is not proof of what Ole chose; owner approval must come
+    from his own messages.
 
     Outside-attendee events do not qualify by default, because most are not
     worth a note. Events Ole names (terms or event ids) always qualify and
@@ -45,10 +47,10 @@ class PrepConfig:
     outside_attendees_qualify: bool = False
     important_terms: tuple = ()
     important_event_ids: tuple = ()
-    owner_set: frozenset = frozenset()
+    configured: frozenset = frozenset()
 
     def source(self, name):
-        return 'owner' if name in self.owner_set else 'default'
+        return 'configured' if name in self.configured else 'default'
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,13 @@ def outside_attendees(event, own_addresses):
         and a.get('responseStatus') != 'declined' and a['email'].casefold() not in own}))
 
 
+def _owner_involved(event, own_addresses):
+    own = {a.casefold() for a in own_addresses}
+    if str(event.get('organizer', {}).get('email', '')).casefold() in own or event.get('organizer', {}).get('self'):
+        return True
+    return any(a.get('self') and a.get('responseStatus') in ('accepted', 'tentative') for a in event.get('attendees', []))
+
+
 def qualifies(event, own_addresses, config=None):
     """Return the reason this event needs preparation, or None.
 
@@ -95,6 +104,8 @@ def qualifies(event, own_addresses, config=None):
         return 'owner_named_event'
     if any(str(t).strip() and str(t).casefold() in title.casefold() for t in config.important_terms):
         return 'owner_named_topic'
+    if not _owner_involved(event, own_addresses):
+        return None  # a stranger's invite title must not trigger preparation or mail lookups
     minutes = (_stamp(event['end']['dateTime']) - _stamp(event['start']['dateTime'])).total_seconds() / 60
     if not config.min_minutes <= minutes <= config.max_minutes or ROUTINE.search(title):
         return None

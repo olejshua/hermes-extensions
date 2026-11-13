@@ -9,7 +9,7 @@ NOW = datetime.fromisoformat('2026-11-13T09:00:00+01:00')
 
 
 def make_event(start='2026-11-13T14:00:00+01:00', end='2026-11-13T14:30:00+01:00', **extra):
-    ev = {'id': 'e1', 'summary': 'Fundraising Session', 'start': {'dateTime': start}, 'end': {'dateTime': end},
+    ev = {'organizer': {'email': 'me@example.invalid'}, 'id': 'e1', 'summary': 'Fundraising Session', 'start': {'dateTime': start}, 'end': {'dateTime': end},
           'attendees': [{'email': 'me@example.invalid', 'self': True},
                         {'email': 'd@outside.invalid', 'displayName': 'David'}]}
     ev.update(extra)
@@ -135,9 +135,47 @@ class DaemonTests(Base):
         self.reads.event = make_event(summary='Austausch')
         self.assertEqual(self.run_tick(Sender(), activate=False)['due'], 0)
         self.reads.event = make_event(summary='Austausch')
-        cfg = PrepConfig(important_terms=('austausch',), owner_set=frozenset({'important_terms'}))
+        cfg = PrepConfig(important_terms=('austausch',), configured=frozenset({'important_terms'}))
         self.assertEqual(self.run_tick(Sender(), activate=False, config=cfg)['due'], 1)
 
+    def test_source_rejection_degrades_to_calendar_note_with_gap(self):
+        class Broken:
+            def collect(self, event, allowed): raise RuntimeError('403')
+        sender = Sender(OK)
+        report = self.run_tick(sender, evidence=Broken())
+        self.assertEqual(report['delivered'], 1)
+        self.assertIn('nicht erreichbar', sender.sent[0][1]); self.assertIn('Im Kalender', sender.sent[0][1])
+
+    def test_concurrent_ticks_send_once(self):
+        import threading
+        sender = Sender(OK, OK, OK, OK)
+        reports = []
+        threads = [threading.Thread(target=lambda: reports.append(self.run_tick(sender))) for _ in range(4)]
+        [t.start() for t in threads]; [t.join() for t in threads]
+        self.assertEqual(len(sender.sent), 1)
+
+    def test_crash_mid_send_becomes_unknown_never_replayed(self):
+        from gtm.prep import due_preparation
+        due = due_preparation(make_event(), calendar_id='cal', own_addresses=OWN, now=NOW)
+        self.store.claim(due, NOW.timestamp())
+        self.store.set(due.identity, 'rendered', NOW.timestamp(), message='note')
+        self.assertTrue(self.store.begin_send(due.identity, NOW.timestamp()))
+        self.assertFalse(self.store.begin_send(due.identity, NOW.timestamp()))
+        sender = Sender(OK)
+        later = NOW.replace(minute=30)
+        report = self.run_tick(sender, now=later)
+        self.assertEqual((sender.sent, report['stale_settled']), ([], 1))
+        self.assertEqual(self.store.get(due.identity)['state'], 'delivery_unknown')
+
+    def test_guarded_transitions_cannot_move_state_backwards(self):
+        from gtm.prep import due_preparation
+        due = due_preparation(make_event(), calendar_id='cal', own_addresses=OWN, now=NOW)
+        self.store.claim(due, 1.0)
+        self.assertFalse(self.store.set(due.identity, 'delivered', 2.0, receipt='r', only_from=('send_attempted',)))
+        self.assertEqual(self.store.get(due.identity)['state'], 'claimed')
+        self.store.set(due.identity, 'delivered', 3.0, receipt='r')
+        self.assertFalse(self.store.set(due.identity, 'rendered', 4.0, only_from=('claimed',)))
+        self.assertEqual(self.store.get(due.identity)['state'], 'delivered')
 
 if __name__ == '__main__':
     unittest.main()

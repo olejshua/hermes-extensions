@@ -7,6 +7,7 @@ OWN = ('me@example.invalid',)
 
 def event(start='2026-11-13T14:00:00+01:00', end='2026-11-13T14:30:00+01:00', **extra):
     base = {'id': 'e1', 'summary': 'Fundraising Session', 'start': {'dateTime': start}, 'end': {'dateTime': end},
+            'organizer': {'email': 'me@example.invalid'},
             'attendees': [{'email': 'me@example.invalid', 'self': True}, {'email': 'x@outside.invalid'}]}
     base.update(extra)
     return base
@@ -65,9 +66,16 @@ class PrepTests(unittest.TestCase):
         cancelled = dict(short, status='cancelled')
         self.assertIsNone(qualifies(cancelled, OWN, PrepConfig(important_event_ids=('e1',))))
 
-    def test_defaults_are_distinguishable_from_owner_settings(self):
-        cfg = PrepConfig(lead_hours=24, owner_set=frozenset({'lead_hours'}))
-        self.assertEqual((cfg.source('lead_hours'), cfg.source('quiet_start')), ('owner', 'default'))
+    def test_defaults_are_distinguishable_from_configured_settings(self):
+        cfg = PrepConfig(lead_hours=24, configured=frozenset({'lead_hours'}))
+        self.assertEqual((cfg.source('lead_hours'), cfg.source('quiet_start')), ('configured', 'default'))
+
+    def test_stranger_invite_with_important_title_does_not_qualify(self):
+        stranger = event(organizer={'email': 'x@outside.invalid'},
+                         attendees=[{'email': 'me@example.invalid', 'self': True, 'responseStatus': 'needsAction'}])
+        self.assertIsNone(qualifies(stranger, OWN))
+        stranger['attendees'][0]['responseStatus'] = 'accepted'
+        self.assertEqual(qualifies(stranger, OWN), 'important_title')
 
     def test_missed_window_is_explicit_not_delivered(self):
         result = due('2026-11-13T13:00:00+01:00', max_delay_seconds=600)

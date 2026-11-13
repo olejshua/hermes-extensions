@@ -16,6 +16,8 @@ from gtm.briefing_daemon import CODE, DESTINATION, ReviewRequired, private_dir, 
 from gtm.prep import PrepConfig
 from gtm.prep_adapters import CalendarReads, MailEvidence, PrivateSender, evidence_drafter
 from gtm.prep_daemon import PrepStore, tick
+from gtm.commitments import CommitmentStore, commitment_tick
+from zoneinfo import ZoneInfo
 
 CONTRACT = 'reviewed-prep-readonly-v1'
 SETTABLE = {'lead_hours': int, 'outside_attendees_qualify': bool, 'important_terms': tuple, 'important_event_ids': tuple}
@@ -30,7 +32,7 @@ def config_from(permission):
     for name, value in values.items():
         args[name] = clock_time.fromisoformat(value) if name in ('quiet_start', 'quiet_end', 'evening_slot') else \
             (tuple(value) if SETTABLE[name] is tuple else value)
-    return PrepConfig(**args, owner_set=frozenset(values))
+    return PrepConfig(**args, configured=frozenset(values))
 
 
 def main():
@@ -52,12 +54,16 @@ def main():
     config = config_from(permission)
     allowed = tuple(permission.get('allowed_sources', ()))
     store = PrepStore(private_dir(args.state) / 'prep.sqlite3')
+    commitments = CommitmentStore(private_dir(args.state) / 'commitments.sqlite3')
     reads, evidence, sender = CalendarReads(), MailEvidence(), PrivateSender(args.state)
     while True:
         try:
             report = tick(reads, store, sender, evidence, evidence_drafter, now=dt.datetime.now(dt.timezone.utc),
                           config=config, allowed_sources=allowed, own_addresses=(CODE,), activate=args.activate)
             print(json.dumps({k: v for k, v in report.items() if k != 'notes'}), flush=True)
+            if 'commitments' in allowed:
+                done = commitment_tick(commitments, sender, dt.datetime.now(dt.timezone.utc), ZoneInfo('Europe/Berlin'), activate=args.activate)
+                print(json.dumps({k: v for k, v in done.items() if k != 'message'}), flush=True)
         except Exception:
             print(json.dumps({'abstain': True, 'reason': 'prep_pass_unavailable'}), flush=True)
         if args.once:
