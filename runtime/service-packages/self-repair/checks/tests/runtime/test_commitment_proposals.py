@@ -3,7 +3,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / 'gtm'))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from gtm.commitment_proposals import ConsumedMessages, reconcile, render_pending, UnprovenEventContract, confirm_from_owner_event, ProposalStore, confirm_from_owner_message, confirmation_phrase, flags_for, propose_from_thread  # noqa: E402
+from gtm.commitment_proposals import deliver_notice, ConsumedMessages, reconcile, render_pending, UnprovenEventContract, confirm_from_owner_event, ProposalStore, confirm_from_owner_message, confirmation_phrase, flags_for, propose_from_thread  # noqa: E402
 from gtm.commitments import CommitmentStore  # noqa: E402
 from gtm.mail_commitments import MailCommitment, MailSource  # noqa: E402
 from test_gmail_mail_source import Svc, msg, OWNER  # noqa: E402
@@ -235,6 +235,46 @@ class Flow(unittest.TestCase):
         self.assertIn('noch nichts übernommen', text); self.assertIn('„ich schicke das Angebot“', text)
         self.assertIn('later_own_message_may_withdraw', text); self.assertIn(confirmation_phrase(row), text)
         self.assertEqual(self.count(), 0)
+
+    def sender(self, results):
+        calls = []
+        class S:
+            def send(s, identity, message):
+                calls.append(message)
+                r = results.pop(0)
+                if isinstance(r, Exception): raise r
+                return r
+        return S(), calls
+
+    def test_notice_dry_run_sends_nothing_and_empty_sends_nothing(self):
+        snd, calls = self.sender([])
+        self.assertEqual(deliver_notice(self.props, snd, activate=True)['state'], 'none')
+        self.run_flow([msg('m1', ['SENT'], body='ich schicke das Angebot')])
+        rep = deliver_notice(self.props, snd, activate=False)
+        self.assertEqual((rep['state'], calls), ('planned', []))
+        self.assertEqual(deliver_notice(self.props, snd, activate=True, allowed_now=False)['state'], 'deferred')
+        self.assertEqual(calls, [])
+
+    def test_notice_needs_a_receipt_and_unknown_is_never_replayed(self):
+        self.run_flow([msg('m1', ['SENT'], body='ich schicke das Angebot')])
+        snd, calls = self.sender([{'success': True}, {'success': True, 'message_id': 'x'}])
+        self.assertEqual(deliver_notice(self.props, snd, activate=True)['state'], 'delivery_unknown')
+        self.assertEqual(deliver_notice(self.props, snd, activate=True)['state'], 'already_handled')
+        self.assertEqual(len(calls), 1)
+
+    def test_delivered_once_per_text_and_new_text_is_a_new_notice(self):
+        self.run_flow([msg('m1', ['SENT'], body='ich schicke das Angebot')])
+        snd, calls = self.sender([{'success': True, 'message_id': 'tg-9'}, {'success': True, 'message_id': 'tg-10'}])
+        self.assertTrue(deliver_notice(self.props, snd, activate=True)['delivered'])
+        self.assertEqual(deliver_notice(self.props, snd, activate=True)['state'], 'already_handled')
+        self.props.propose('mail:t1:m9:b', 'Zweites', 'Zweites Zitat hier', None, [], 'h')
+        self.assertTrue(deliver_notice(self.props, snd, activate=True)['delivered'])
+        self.assertEqual(len(calls), 2)
+
+    def test_send_exception_stays_unknown(self):
+        self.run_flow([msg('m1', ['SENT'], body='ich schicke das Angebot')])
+        snd, calls = self.sender([RuntimeError('x')])
+        self.assertEqual(deliver_notice(self.props, snd, activate=True)['state'], 'delivery_unknown')
 
 if __name__ == '__main__':
     unittest.main()

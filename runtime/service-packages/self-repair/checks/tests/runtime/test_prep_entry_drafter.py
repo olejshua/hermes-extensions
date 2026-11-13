@@ -35,3 +35,16 @@ class T(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class Quiet(unittest.TestCase):
+    def test_quiet_window_wraps_midnight(self):
+        import datetime as dt
+        from gtm.prep import PrepConfig
+        from gtm.prep_daemon_entry import outside_quiet_hours
+        c = PrepConfig()
+        at = lambda h, m: dt.datetime(2026, 11, 13, h, m)
+        self.assertFalse(outside_quiet_hours(c, at(22, 0)))
+        self.assertFalse(outside_quiet_hours(c, at(7, 59)))
+        self.assertTrue(outside_quiet_hours(c, at(8, 0)))
+        self.assertTrue(outside_quiet_hours(c, at(21, 29)))

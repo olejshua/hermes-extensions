@@ -82,6 +82,13 @@ def build_drafter(permission, complete_factory=None, ledger=None):
     return ModelPrepDrafter(complete_factory(permission), mode, transmission_approved=True, ledger=ledger, scope=scope)
 
 
+def outside_quiet_hours(config, local_now):
+    """Quiet window from the prep config (design default 21:30-08:00 unless the owner's file set it); wraps midnight."""
+    t, start, end = local_now.time(), config.quiet_start, config.quiet_end
+    quiet = (t >= start or t < end) if start > end else (start <= t < end)
+    return not quiet
+
+
 def proposal_section(permission, allowed, proposals, commitments, *, activate, service_factory=None, complete_factory=None,
                      ledger=None):
     """Mail-commitment proposals for the owner-private note. Returns (text, report).
@@ -144,8 +151,11 @@ def main():
             print(json.dumps({k: v for k, v in report.items() if k != 'notes'}), flush=True)
             if 'commitments' in allowed:
                 from gtm.commitment_proposals import ProposalStore
-                note, prep = proposal_section(permission, allowed, ProposalStore(private_dir(args.state) / 'proposals.sqlite3'), commitments, activate=args.activate)
-                print(json.dumps({'proposals': prep, 'pending': bool(note)}), flush=True)
+                proposals_store = ProposalStore(private_dir(args.state) / 'proposals.sqlite3')
+                note, prep = proposal_section(permission, allowed, proposals_store, commitments, activate=args.activate)
+                from gtm.commitment_proposals import deliver_notice
+                notice = deliver_notice(proposals_store, sender, activate=args.activate, allowed_now=outside_quiet_hours(config, dt.datetime.now(ZoneInfo('Europe/Berlin'))))
+                print(json.dumps({'proposals': prep, 'pending': bool(note), 'notice': notice}), flush=True)
                 done = commitment_tick(commitments, sender, dt.datetime.now(dt.timezone.utc), ZoneInfo('Europe/Berlin'), activate=args.activate)
                 print(json.dumps({k: v for k, v in done.items() if k != 'message'}), flush=True)
         except Exception:

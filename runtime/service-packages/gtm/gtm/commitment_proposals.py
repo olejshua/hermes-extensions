@@ -66,6 +66,7 @@ class ProposalStore:
     def __init__(self, path):
         self.path = Path(path); self.path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.path) as db:
+            db.execute('CREATE TABLE IF NOT EXISTS notice(key TEXT PRIMARY KEY, state TEXT NOT NULL, receipt TEXT)')
             db.execute('CREATE TABLE IF NOT EXISTS proposal(ref TEXT PRIMARY KEY, title TEXT NOT NULL, quote TEXT NOT NULL, due TEXT, '
                        'flags TEXT NOT NULL, thread_hash TEXT NOT NULL, state TEXT NOT NULL DEFAULT "pending")')
         self.path.chmod(0o600)
@@ -197,6 +198,40 @@ def render_pending(proposals: ProposalStore):
         lines.append('Unklar, ob übernommen (bitte prüfen):')
         lines += [f"- {row['title']}" for row in unclear]
     return '\n'.join(lines)
+
+
+def deliver_notice(proposals: ProposalStore, sender, *, activate, allowed_now=True):
+    """Send the rendered proposal section to the owner-private chat at most once per distinct text.
+
+    Dry-run reports only. The claim is written before the send and a result without a success receipt
+    stays 'unknown' (never replayed); only a result with success and a message id counts as delivered.
+    A changed text (new or decided proposals) is a new notice. The receipt id is kept so a later
+    reply-bound confirmation can refer to the notice."""
+    text = render_pending(proposals)
+    report = dict(planned=bool(text), delivered=False, state='none', dry_run=not activate)
+    if not text:
+        return report
+    if not activate or not allowed_now:
+        report['state'] = 'planned' if activate is False else 'deferred'
+        return report
+    key = hashlib.sha256(text.encode()).hexdigest()
+    with sqlite3.connect(proposals.path, timeout=15) as db:
+        if db.execute("INSERT OR IGNORE INTO notice(key,state) VALUES(?,'send_attempted')", (key,)).rowcount != 1:
+            report['state'] = 'already_handled'; return report
+    try:
+        result = sender.send(key, text)
+    except Exception:
+        result = None
+    if isinstance(result, dict) and result.get('success') is True and result.get('message_id'):
+        state, receipt = 'delivered', str(result['message_id'])
+    elif isinstance(result, dict) and result.get('success') is False and not result.get('message_id'):
+        state, receipt = 'delivery_failed', None
+    else:
+        state, receipt = 'delivery_unknown', None
+    with sqlite3.connect(proposals.path, timeout=15) as db:
+        db.execute('UPDATE notice SET state=?, receipt=? WHERE key=?', (state, receipt, key))
+    report.update(state=state, delivered=state == 'delivered')
+    return report
 
 
 def confirm_from_owner_event(proposals, commitments, service, owner_address, *, ref, event, gateway, policy, consumed, contract=None):
