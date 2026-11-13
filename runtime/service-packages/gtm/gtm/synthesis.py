@@ -10,8 +10,11 @@ Every claim must carry the cited evidence ref and an exact quote from that evide
 fail are dropped and counted; too little valid evidence means abstention, never a guess.
 """
 from __future__ import annotations
+import hashlib
 import json
 import re
+import sqlite3
+from pathlib import Path
 
 from gtm.mail_commitments import MailSource, plan_mail_commitments, MailCommitment
 from gtm.prep_adapters import evidence_drafter
@@ -19,6 +22,25 @@ from gtm.prep_adapters import evidence_drafter
 MODES = ('off', 'dry_run', 'on')
 _CONTROL = re.compile(r'[\x00-\x08\x0b-\x1f\x7f]')
 MAX_TEXT = 400
+
+
+class ModelLedger:
+    """Once-only model attempts. A key is claimed before the call and never released, so an
+    uncertain or failed attempt is not replayed automatically (it costs money and resends data)."""
+
+    def __init__(self, path):
+        self.path = Path(path); self.path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.path) as db:
+            db.execute('CREATE TABLE IF NOT EXISTS attempt(key TEXT PRIMARY KEY)')
+        self.path.chmod(0o600)
+
+    def claim(self, key):
+        with sqlite3.connect(self.path, timeout=15) as db:
+            return db.execute('INSERT OR IGNORE INTO attempt(key) VALUES(?)', (key,)).rowcount == 1
+
+
+def attempt_key(*parts):
+    return hashlib.sha256('\x1f'.join(str(p) for p in parts).encode()).hexdigest()
 
 
 def _clean(value):
@@ -77,13 +99,13 @@ PREP_INSTRUCTION = (
 class ModelPrepDrafter:
     """Same signature as evidence_drafter(event, evidence)."""
 
-    def __init__(self, complete=None, mode='off', min_known=1, *, transmission_approved=False):
+    def __init__(self, complete=None, mode='off', min_known=1, *, transmission_approved=False, ledger=None):
         if mode not in MODES:
             raise ValueError('unknown mode')
         if mode != 'off' and transmission_approved is not True:
             raise PermissionError('Calling a model transmits private source data; owner approval of provider/account required')
         self.complete, self.mode, self.min_known = complete, mode, min_known
-        self.last_report = None
+        self.ledger, self.last_report = ledger, None
 
     def __call__(self, event, evidence):
         fallback = evidence_drafter(event, evidence)
@@ -91,6 +113,9 @@ class ModelPrepDrafter:
             self.last_report = dict(mode=self.mode, status='not_run')
             return fallback
         by_ref = {e['ref']: e['text'] for e in evidence}
+        if self.ledger is not None and not self.ledger.claim(attempt_key('prep', event.get('id'), sorted(by_ref.items()))):
+            self.last_report = dict(mode=self.mode, status='already_attempted')
+            return fallback
         title = _clean(str(event.get('summary') or 'Termin'))[:120]
         prompt = f'{PREP_INSTRUCTION}\nTermin: {title}\nBelege: {_fence(list(evidence))}'
         try:

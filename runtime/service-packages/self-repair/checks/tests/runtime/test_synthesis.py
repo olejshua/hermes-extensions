@@ -45,6 +45,17 @@ class Prep(unittest.TestCase):
                 extract_mail_commitments(OWNER, src(), c, mode)
             self.assertEqual(c.calls, [])
 
+    def test_same_input_is_attempted_once(self):
+        import tempfile
+        from gtm.synthesis import ModelLedger
+        with tempfile.TemporaryDirectory() as tmp:
+            c = model(GOOD); d = ModelPrepDrafter(c, 'on', transmission_approved=True, ledger=ModelLedger(Path(tmp) / 'l.db'))
+            d(dict(EVENT, id='e1'), EVID); out = d(dict(EVENT, id='e1'), EVID)
+            self.assertEqual(len(c.calls), 1); self.assertEqual(d.last_report['status'], 'already_attempted')
+            self.assertNotIn('Laut Beleg', json.dumps(out, ensure_ascii=False))
+            d(dict(EVENT, id='e1'), EVID + [dict(source='mail', ref='mail:2', text='Neue Mail danach')])
+            self.assertEqual(len(c.calls), 2)
+
     def test_off_never_calls_model(self):
         c = model(GOOD); d = ModelPrepDrafter(c, 'off')
         out = d(EVENT, EVID)
