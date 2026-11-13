@@ -152,7 +152,12 @@ def main():
             if 'commitments' in allowed:
                 from gtm.commitment_proposals import ProposalStore
                 proposals_store = ProposalStore(private_dir(args.state) / 'proposals.sqlite3')
-                note, prep = proposal_section(permission, allowed, proposals_store, commitments, activate=args.activate)
+                from gtm.codex_completion import mail_factory
+                from gtm.prep_adapters import code_gmail_service
+                from gtm.synthesis import ModelLedger
+                note, prep = proposal_section(permission, allowed, proposals_store, commitments,
+                                              service_factory=code_gmail_service, complete_factory=mail_factory,
+                                              ledger=ModelLedger(private_dir(args.state) / 'model-attempts.sqlite3'), activate=args.activate)
                 from gtm.commitment_proposals import deliver_notice
                 notice = deliver_notice(proposals_store, sender, activate=args.activate, allowed_now=outside_quiet_hours(config, dt.datetime.now(ZoneInfo('Europe/Berlin'))))
                 print(json.dumps({'proposals': prep, 'pending': bool(note), 'notice': notice}), flush=True)

@@ -259,22 +259,43 @@ class Flow(unittest.TestCase):
         self.run_flow([msg('m1', ['SENT'], body='ich schicke das Angebot')])
         snd, calls = self.sender([{'success': True}, {'success': True, 'message_id': 'x'}])
         self.assertEqual(deliver_notice(self.props, snd, activate=True)['state'], 'delivery_unknown')
-        self.assertEqual(deliver_notice(self.props, snd, activate=True)['state'], 'already_handled')
+        self.assertEqual(deliver_notice(self.props, snd, activate=True, now=10**9)['state'], 'none')
         self.assertEqual(len(calls), 1)
 
     def test_delivered_once_per_text_and_new_text_is_a_new_notice(self):
         self.run_flow([msg('m1', ['SENT'], body='ich schicke das Angebot')])
         snd, calls = self.sender([{'success': True, 'message_id': 'tg-9'}, {'success': True, 'message_id': 'tg-10'}])
-        self.assertTrue(deliver_notice(self.props, snd, activate=True)['delivered'])
-        self.assertEqual(deliver_notice(self.props, snd, activate=True)['state'], 'already_handled')
+        self.assertTrue(deliver_notice(self.props, snd, activate=True, now=10**6)['delivered'])
+        self.assertEqual(deliver_notice(self.props, snd, activate=True, now=10**9)['state'], 'none')
         self.props.propose('mail:t1:m9:b', 'Zweites', 'Zweites Zitat hier', None, [], 'h')
-        self.assertTrue(deliver_notice(self.props, snd, activate=True)['delivered'])
+        self.assertTrue(deliver_notice(self.props, snd, activate=True, now=10**9)['delivered'])
         self.assertEqual(len(calls), 2)
 
     def test_send_exception_stays_unknown(self):
         self.run_flow([msg('m1', ['SENT'], body='ich schicke das Angebot')])
         snd, calls = self.sender([RuntimeError('x')])
         self.assertEqual(deliver_notice(self.props, snd, activate=True)['state'], 'delivery_unknown')
+
+    def test_reorder_and_decided_removal_do_not_renotify_and_new_items_are_batched(self):
+        self.props.propose('mail:t1:m1:a', 'A', 'Zitat A hier', None, [], 'h')
+        self.props.propose('mail:t1:m1:b', 'B', 'Zitat B hier', None, [], 'h')
+        snd, calls = self.sender([{'success': True, 'message_id': '1'}, {'success': True, 'message_id': '2'}])
+        first = deliver_notice(self.props, snd, activate=True, now=10**6)
+        self.assertTrue(first['delivered']); self.assertIn('Zitat A', calls[0])
+        self.assertLess(calls[0].index('A'), calls[0].index('B'))             # canonical order by ref
+        self.props.decide('mail:t1:m1:a', 'dismissed')                          # decided item drops out
+        self.assertEqual(deliver_notice(self.props, snd, activate=True, now=10**9)['state'], 'none')
+        self.props.propose('mail:t1:m1:c', 'C', 'Zitat C hier', None, [], 'h')  # genuinely new, but too soon
+        self.assertEqual(deliver_notice(self.props, snd, activate=True, now=10**6 + 60)['state'], 'batched')
+        self.assertEqual(len(calls), 1)
+        later = deliver_notice(self.props, snd, activate=True, now=10**6 + 7 * 3600)
+        self.assertTrue(later['delivered']); self.assertIn('Zitat B', calls[1]); self.assertIn('Zitat C', calls[1])
+        self.assertEqual(len(calls), 2)
+
+    def test_empty_never_sends_and_changed_flags_are_a_new_version(self):
+        snd, calls = self.sender([{'success': True, 'message_id': '1'}])
+        self.assertEqual(deliver_notice(self.props, snd, activate=True)['state'], 'none')
+        self.assertEqual(calls, [])
 
 if __name__ == '__main__':
     unittest.main()

@@ -66,7 +66,8 @@ class ProposalStore:
     def __init__(self, path):
         self.path = Path(path); self.path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.path) as db:
-            db.execute('CREATE TABLE IF NOT EXISTS notice(key TEXT PRIMARY KEY, state TEXT NOT NULL, receipt TEXT)')
+            db.execute('CREATE TABLE IF NOT EXISTS notice(key TEXT PRIMARY KEY, state TEXT NOT NULL, receipt TEXT, at REAL NOT NULL DEFAULT 0)')
+            db.execute('CREATE TABLE IF NOT EXISTS notified(version TEXT PRIMARY KEY)')
             db.execute('CREATE TABLE IF NOT EXISTS proposal(ref TEXT PRIMARY KEY, title TEXT NOT NULL, quote TEXT NOT NULL, due TEXT, '
                        'flags TEXT NOT NULL, thread_hash TEXT NOT NULL, state TEXT NOT NULL DEFAULT "pending")')
         self.path.chmod(0o600)
@@ -200,24 +201,44 @@ def render_pending(proposals: ProposalStore):
     return '\n'.join(lines)
 
 
-def deliver_notice(proposals: ProposalStore, sender, *, activate, allowed_now=True):
-    """Send the rendered proposal section to the owner-private chat at most once per distinct text.
+MIN_NOTICE_INTERVAL_SECONDS = 6 * 3600  # design default, not an owner preference
 
-    Dry-run reports only. The claim is written before the send and a result without a success receipt
-    stays 'unknown' (never replayed); only a result with success and a message id counts as delivered.
-    A changed text (new or decided proposals) is a new notice. The receipt id is kept so a later
-    reply-bound confirmation can refer to the notice."""
-    text = render_pending(proposals)
-    report = dict(planned=bool(text), delivered=False, state='none', dry_run=not activate)
-    if not text:
-        return report
-    if not activate or not allowed_now:
-        report['state'] = 'planned' if activate is False else 'deferred'
-        return report
-    key = hashlib.sha256(text.encode()).hexdigest()
+
+def deliver_notice(proposals: ProposalStore, sender, *, activate, allowed_now=True, now=None,
+                   min_interval=MIN_NOTICE_INTERVAL_SECONDS):
+    """Send the pending proposals to the owner-private chat only when something NEW needs attention.
+
+    Material change = a pending proposal version never notified before. Reordering, a decided or
+    dismissed proposal dropping out, or an unchanged set never creates a notice, and an empty set
+    never sends. New items arriving within `min_interval` of the last notice wait and are batched
+    into the next one. The claim is written before the send; only success plus a message id counts
+    as delivered; anything else stays unknown and is not replayed. Dry-run reports only.
+    The text lists all pending items in a canonical (sorted by ref) order.
+    """
+    import time as _time
+    clock = _time.time() if now is None else now
+    rows = sorted(proposals.pending(), key=lambda r: r['ref'])
+    versions = [proposal_version(r) for r in rows]
     with sqlite3.connect(proposals.path, timeout=15) as db:
-        if db.execute("INSERT OR IGNORE INTO notice(key,state) VALUES(?,'send_attempted')", (key,)).rowcount != 1:
+        known = {r[0] for r in db.execute('SELECT version FROM notified')}
+        last = db.execute('SELECT max(at) FROM notice').fetchone()[0] or 0
+    fresh = [v for v in versions if v not in known]
+    report = dict(planned=bool(fresh), delivered=False, state='none', dry_run=not activate, new=len(fresh))
+    if not fresh:
+        return report
+    if not activate:
+        report['state'] = 'planned'; return report
+    if not allowed_now:
+        report['state'] = 'deferred'; return report
+    if clock - last < min_interval:
+        report['state'] = 'batched'; return report
+    text = render_pending(proposals)
+    key = hashlib.sha256('\n'.join(sorted(versions)).encode()).hexdigest()
+    with sqlite3.connect(proposals.path, timeout=15) as db:
+        if db.execute("INSERT OR IGNORE INTO notice(key,state,at) VALUES(?,'send_attempted',?)", (key, clock)).rowcount != 1:
             report['state'] = 'already_handled'; return report
+        # attempted versions are never re-announced, whatever the outcome
+        db.executemany('INSERT OR IGNORE INTO notified(version) VALUES(?)', [(v,) for v in versions])
     try:
         result = sender.send(key, text)
     except Exception:

@@ -68,6 +68,22 @@ class MailEvidence:
         return items
 
 
+def code_gmail_service(reads=None):
+    """Gmail client for the owner's 'code' mailbox, only after the profile address equals CODE.
+
+    Same acquisition and identity check as MailEvidence (mail_module.service('code') plus
+    verified_profile, or users.getProfile). Building the client reads nothing by itself."""
+    reads = reads or ExistingReads()
+    svc = reads.mail_module.service('code')
+    getter = getattr(reads.mail_module, 'verified_profile', None)
+    actual = getter(svc) if callable(getter) else None
+    if actual is None:
+        actual = svc.users().getProfile(userId='me').execute().get('emailAddress', '')
+    if not isinstance(actual, str) or actual.casefold() != CODE.casefold():
+        raise ReviewRequired('mailbox_identity_mismatch')
+    return svc
+
+
 class TwentyEvidence:
     """Read-only CRM facts for the event's outside attendees, only when 'twenty' is allowed.
 

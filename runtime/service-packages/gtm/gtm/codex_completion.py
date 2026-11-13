@@ -105,3 +105,8 @@ def make_complete(schema, *, model, effort='low', load=modules):
 def prep_factory(permission):
     cfg = permission.get('synthesis') or {}
     return make_complete(PREP_SCHEMA, model=cfg.get('model'), effort=cfg.get('effort', 'low'))
+
+
+def mail_factory(permission):
+    cfg = permission.get('synthesis') or {}
+    return make_complete(MAIL_SCHEMA, model=cfg.get('model'), effort=cfg.get('effort', 'low'))

@@ -75,3 +75,26 @@ class T(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class Factory(unittest.TestCase):
+    def test_identity_checked_service_and_nothing_read_at_build(self):
+        import types
+        from gtm.prep_adapters import code_gmail_service
+        svc = Svc({'messages': []})
+        reads = types.SimpleNamespace(mail_module=types.SimpleNamespace(service=lambda alias: svc if alias == 'code' else None))
+        self.assertIs(code_gmail_service(reads), svc); self.assertEqual(svc.calls, [])
+        other = types.SimpleNamespace(mail_module=types.SimpleNamespace(service=lambda a: svc, verified_profile=lambda s: 'x@example.invalid'))
+        with self.assertRaises(ReviewRequired):
+            code_gmail_service(other)
+
+    def test_default_main_wiring_without_permission_reads_and_calls_nothing(self):
+        import types, tempfile
+        from gtm.codex_completion import mail_factory
+        built = []
+        d = Path(tempfile.mkdtemp())
+        props, commit = ProposalStore(d / 'p.db'), CommitmentStore(d / 'c.db')
+        text, rep = proposal_section({}, ('mail_commitments',), props, commit, activate=False,
+                                     service_factory=lambda: built.append('svc'), complete_factory=mail_factory,
+                                     ledger=ModelLedger(d / 'l.db'))
+        self.assertEqual((built, rep['status'], text), ([], 'render_only', ''))
