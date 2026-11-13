@@ -27,3 +27,22 @@ class DreamOutcomeHealth(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class StoredRunHealth(unittest.TestCase):
+    def public(self, **row):
+        from hermes_second_brain.dreaming.runner import _public_run
+        return _public_run(dict(run_id='r', status='complete', rounds=0, **row))
+
+    def test_stored_zero_round_run_is_no_work_and_keeps_old_fields(self):
+        result = self.public(summary={'sessions': 0, 'profile_failures': 0})
+        self.assertEqual((result['health'], result['status'], result['rounds']), ('no_work', 'complete', 0))
+
+    def test_stored_profile_failures_degrade(self):
+        self.assertEqual(self.public(summary={'sessions': 2, 'profile_failures': 1}, )['health'], 'degraded_profile')
+
+    def test_stored_work_run_ok_and_missing_summary_safe(self):
+        from hermes_second_brain.dreaming.runner import _public_run
+        self.assertEqual(_public_run(dict(run_id='r', status='complete', rounds=2, summary={'sessions': 4}))['health'], 'ok')
+        self.assertEqual(_public_run(dict(run_id='r', status='failed', rounds=1))['health'], 'failed')
+        self.assertEqual(_public_run(None), None)

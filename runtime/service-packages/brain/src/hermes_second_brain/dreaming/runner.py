@@ -1522,7 +1522,25 @@ def _public_run(run: dict[str, Any] | None) -> dict[str, Any] | None:
             summary["openviking_classified"] = summary["promotions"]
         summary.pop("promotions", None)
     public["summary"] = summary
+    public["health"] = _stored_run_health(public.get("status"), public.get("rounds"), summary)
     return public
+
+
+def _stored_run_health(status: Any, rounds: Any, summary: Any) -> str:
+    """Same meaning as SweepOutcome.health, derived from a stored run row."""
+
+    if status != "complete":
+        return str(status or "unknown")
+    summary = summary if isinstance(summary, dict) else {}
+    failures = summary.get("profile_failures")
+    if isinstance(failures, (list, tuple)):
+        failures = len(failures)
+    if isinstance(failures, int) and failures > 0:
+        return "degraded_profile"
+    sessions = summary.get("sessions")
+    if not rounds and not sessions:
+        return "no_work"
+    return "ok"
 
 
 def _public_phase(phase: dict[str, Any]) -> dict[str, Any]:
