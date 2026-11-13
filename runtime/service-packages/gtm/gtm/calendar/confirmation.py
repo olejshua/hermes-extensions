@@ -93,7 +93,13 @@ def authored_text(body):
     """Conservative quote boundary; unsupported mail layouts remain review cases."""
     import re
     lines=body.splitlines(keepends=True);selected=[]
-    for line in lines:
+    for index,line in enumerate(lines):
+        # Gmail can wrap the real sender header before 'wrote:'. Only the
+        # bounded full address-bearing header is a quote boundary; arbitrary
+        # body markers keep their ordinary data meaning.
+        header=''.join(lines[index:index+3])
+        wrapped=re.match(r'^\s*(?:On\s+.+?\bwrote\s*:|Am\s+.+?\bschrieb\s*:)',header,re.I|re.S)
+        if wrapped and re.search(r'<[^<>\s]+@[^<>\s]+>',wrapped.group(0)):break
         if re.match(r'^\s*(?:>|Von:|From:|-----Original Message-----|-----Ursprüngliche Nachricht-----|Am .+schrieb\s*:|On .+wrote\s*:)',line,re.I):break
         selected.append(line)
     return ''.join(selected).strip()
