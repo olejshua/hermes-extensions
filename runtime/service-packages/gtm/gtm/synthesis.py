@@ -25,18 +25,41 @@ MAX_TEXT = 400
 
 
 class ModelLedger:
-    """Once-only model attempts. A key is claimed before the call and never released, so an
-    uncertain or failed attempt is not replayed automatically (it costs money and resends data)."""
+    """Bounded, once-claimed model attempts per scope.
 
-    def __init__(self, path):
-        self.path = Path(path); self.path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.path) as db:
-            db.execute('CREATE TABLE IF NOT EXISTS attempt(key TEXT PRIMARY KEY)')
+    The scope names the owner, source kind, provider/config id and the stable subject (event id,
+    mail message id), never the evidence. Changed evidence or a reschedule does not reset the
+    count: a scope gets at most `max_attempts` attempts (default 1), and a further attempt is only
+    allowed when the canonical evidence hash differs from every earlier attempt. A claim is written
+    in an IMMEDIATE transaction before the call and never released, so a crash or an uncertain
+    result consumes the attempt and is not replayed automatically.
+    """
+
+    def __init__(self, path, max_attempts=1):
+        if type(max_attempts) is not int or max_attempts < 1:
+            raise ValueError('max_attempts must be a positive integer')
+        self.path, self.max_attempts = Path(path), max_attempts
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self._db() as db:
+            db.execute('CREATE TABLE IF NOT EXISTS attempt(scope TEXT NOT NULL, evidence TEXT NOT NULL, PRIMARY KEY(scope, evidence))')
         self.path.chmod(0o600)
 
-    def claim(self, key):
-        with sqlite3.connect(self.path, timeout=15) as db:
-            return db.execute('INSERT OR IGNORE INTO attempt(key) VALUES(?)', (key,)).rowcount == 1
+    def _db(self):
+        db = sqlite3.connect(self.path, timeout=15, isolation_level=None)
+        return db
+
+    def claim(self, scope, evidence_hash):
+        db = self._db()
+        try:
+            db.execute('BEGIN IMMEDIATE')
+            rows = {r[0] for r in db.execute('SELECT evidence FROM attempt WHERE scope=?', (scope,))}
+            ok = evidence_hash not in rows and len(rows) < self.max_attempts
+            if ok:
+                db.execute('INSERT INTO attempt(scope, evidence) VALUES(?,?)', (scope, evidence_hash))
+            db.execute('COMMIT')
+            return ok
+        finally:
+            db.close()
 
 
 def attempt_key(*parts):
@@ -99,13 +122,15 @@ PREP_INSTRUCTION = (
 class ModelPrepDrafter:
     """Same signature as evidence_drafter(event, evidence)."""
 
-    def __init__(self, complete=None, mode='off', min_known=1, *, transmission_approved=False, ledger=None):
+    def __init__(self, complete=None, mode='off', min_known=1, *, transmission_approved=False, ledger=None, scope=''):
         if mode not in MODES:
             raise ValueError('unknown mode')
         if mode != 'off' and transmission_approved is not True:
             raise PermissionError('Calling a model transmits private source data; owner approval of provider/account required')
         self.complete, self.mode, self.min_known = complete, mode, min_known
-        self.ledger, self.last_report = ledger, None
+        self.ledger, self.scope, self.last_report = ledger, scope, None
+        if ledger is not None and not scope:
+            raise ValueError('A ledger needs a scope naming owner, provider and config')
 
     def __call__(self, event, evidence):
         fallback = evidence_drafter(event, evidence)
@@ -113,7 +138,7 @@ class ModelPrepDrafter:
             self.last_report = dict(mode=self.mode, status='not_run')
             return fallback
         by_ref = {e['ref']: e['text'] for e in evidence}
-        if self.ledger is not None and not self.ledger.claim(attempt_key('prep', event.get('id'), sorted(by_ref.items()))):
+        if self.ledger is not None and not self.ledger.claim(attempt_key('prep', self.scope, event.get('id')), attempt_key(*sorted(by_ref.items()))):
             self.last_report = dict(mode=self.mode, status='already_attempted')
             return fallback
         title = _clean(str(event.get('summary') or 'Termin'))[:120]
@@ -144,7 +169,7 @@ MAIL_INSTRUCTION = (
     'wörtlich im quote steht, sonst null. Keine Zusagen: leere Liste.')
 
 
-def extract_mail_commitments(owner_address, source: MailSource, complete=None, mode='off', *, transmission_approved=False):
+def extract_mail_commitments(owner_address, source: MailSource, complete=None, mode='off', *, transmission_approved=False, ledger=None, scope=''):
     """Returns dict(status, planned, review, rejected). Writes nothing; callers record `planned` only after approval.
 
     Provenance and the exact-quote rules are enforced by plan_mail_commitments; items that fail go to
@@ -158,6 +183,11 @@ def extract_mail_commitments(owner_address, source: MailSource, complete=None, m
         raise PermissionError('Calling a model transmits private mail; owner approval of provider/account required')
     # provenance first: no model call for mail that is not the owner's own sent mail
     plan_mail_commitments(owner_address, source, [MailCommitment('probe', 'probe', source.body.strip()[:20])])
+    if ledger is not None:
+        if not scope:
+            raise ValueError('A ledger needs a scope naming owner, provider and config')
+        if not ledger.claim(attempt_key('mail', scope, source.message_id), attempt_key(source.body)):
+            return dict(status='already_attempted', planned=[], review=[], rejected=0)
     prompt = f'{MAIL_INSTRUCTION}\nMail: {_fence(dict(sent_at=source.sent_at, body=source.body))}'
     try:
         data = parse_object(complete(prompt))

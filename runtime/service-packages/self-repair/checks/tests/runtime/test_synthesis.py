@@ -45,16 +45,42 @@ class Prep(unittest.TestCase):
                 extract_mail_commitments(OWNER, src(), c, mode)
             self.assertEqual(c.calls, [])
 
-    def test_same_input_is_attempted_once(self):
-        import tempfile
+    def _drafter(self, tmp, max_attempts=1, scope='owner|openai-codex|cfg1'):
         from gtm.synthesis import ModelLedger
+        c = model(GOOD)
+        return c, ModelPrepDrafter(c, 'on', transmission_approved=True, scope=scope,
+                                   ledger=ModelLedger(Path(tmp) / 'l.db', max_attempts))
+
+    def test_same_input_is_attempted_once_and_order_is_canonical(self):
+        import tempfile
         with tempfile.TemporaryDirectory() as tmp:
-            c = model(GOOD); d = ModelPrepDrafter(c, 'on', transmission_approved=True, ledger=ModelLedger(Path(tmp) / 'l.db'))
-            d(dict(EVENT, id='e1'), EVID); out = d(dict(EVENT, id='e1'), EVID)
+            c, d = self._drafter(tmp)
+            d(dict(EVENT, id='e1'), EVID); out = d(dict(EVENT, id='e1'), list(reversed(EVID)))
             self.assertEqual(len(c.calls), 1); self.assertEqual(d.last_report['status'], 'already_attempted')
             self.assertNotIn('Laut Beleg', json.dumps(out, ensure_ascii=False))
-            d(dict(EVENT, id='e1'), EVID + [dict(source='mail', ref='mail:2', text='Neue Mail danach')])
-            self.assertEqual(len(c.calls), 2)
+
+    def test_changed_evidence_and_reschedule_do_not_reset_the_bound(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            c, d = self._drafter(tmp, max_attempts=2)
+            more = EVID + [dict(source='mail', ref='mail:2', text='Neue Mail danach')]
+            d(dict(EVENT, id='e1'), EVID)
+            d(dict(EVENT, id='e1'), more)                                  # second, evidence changed: allowed
+            d(dict(EVENT, id='e1', start={'dateTime': '2026-11-17T10:00:00+01:00'}), more + [dict(source='mail', ref='mail:3', text='Noch eine Mail')])
+            self.assertEqual(len(c.calls), 2)                              # third is refused: bound reached
+            self.assertEqual(d.last_report['status'], 'already_attempted')
+
+    def test_scope_separates_owner_provider_config_and_concurrent_claims_win_once(self):
+        import tempfile, threading
+        from gtm.synthesis import ModelLedger
+        with tempfile.TemporaryDirectory() as tmp:
+            led = ModelLedger(Path(tmp) / 'l.db'); wins = []
+            ts = [threading.Thread(target=lambda: wins.append(led.claim('s', 'h'))) for _ in range(8)]
+            [t.start() for t in ts]; [t.join() for t in ts]
+            self.assertEqual(sum(wins), 1)
+            self.assertTrue(led.claim('s2', 'h'))
+            with self.assertRaises(ValueError):
+                ModelPrepDrafter(model(GOOD), 'on', transmission_approved=True, ledger=led)
 
     def test_off_never_calls_model(self):
         c = model(GOOD); d = ModelPrepDrafter(c, 'off')
@@ -125,6 +151,16 @@ class Mail(unittest.TestCase):
         out = extract_mail_commitments(OWNER, src(), model(ITEMS), 'on', transmission_approved=True)
         self.assertEqual(out['status'], 'ready'); self.assertEqual(len(out['planned']), 1)
         self.assertEqual(sorted(r['item']['key'] for r in out['review']), ['b', 'c'])
+
+    def test_mail_extraction_is_attempted_once_per_message(self):
+        import tempfile
+        from gtm.synthesis import ModelLedger
+        with tempfile.TemporaryDirectory() as tmp:
+            c = model(ITEMS); led = ModelLedger(Path(tmp) / 'l.db')
+            kw = dict(transmission_approved=True, ledger=led, scope='owner|prov|cfg')
+            self.assertEqual(extract_mail_commitments(OWNER, src(), c, 'on', **kw)['status'], 'ready')
+            self.assertEqual(extract_mail_commitments(OWNER, src(), c, 'on', **kw)['status'], 'already_attempted')
+            self.assertEqual(len(c.calls), 1)
 
     def test_dry_run_is_labelled_and_plans_nothing_to_write(self):
         out = extract_mail_commitments(OWNER, src(), model(ITEMS), 'dry_run', transmission_approved=True)
