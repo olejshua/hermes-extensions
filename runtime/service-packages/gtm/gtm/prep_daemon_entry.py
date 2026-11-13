@@ -14,7 +14,8 @@ from datetime import time as clock_time
 from pathlib import Path
 from gtm.briefing_daemon import CODE, DESTINATION, ReviewRequired, private_dir, verify_private_destination
 from gtm.prep import PrepConfig
-from gtm.prep_adapters import CalendarReads, MailEvidence, PrivateSender, evidence_drafter
+from gtm.prep_adapters import (CalendarReads, CombinedEvidence, MailEvidence, PrivateSender, TwentyEvidence,
+                               Unconfigured, evidence_drafter)
 from gtm.prep_daemon import PrepStore, tick
 from gtm.commitments import CommitmentStore, commitment_tick
 from zoneinfo import ZoneInfo
@@ -33,6 +34,28 @@ def config_from(permission):
         args[name] = clock_time.fromisoformat(value) if name in ('quiet_start', 'quiet_end', 'evening_slot') else \
             (tuple(value) if SETTABLE[name] is tuple else value)
     return PrepConfig(**args, configured=frozenset(values))
+
+
+def build_evidence(permission, allowed, client_factory=None, mail=None):
+    """Collectors for the allowed sources. Building one is not permission to read: every
+    collector still returns nothing unless its source is in `allowed`, and an allowed source
+    without private configuration becomes a named gap in the note."""
+    collectors = [mail or MailEvidence()]
+    allowed_names = {a.casefold() for a in allowed}
+    if 'twenty' in allowed_names or permission.get('twenty'):
+        paths = permission.get('twenty') or {}
+        if 'twenty' in allowed_names and paths.get('helper_dir') and paths.get('key_path'):
+            factory = client_factory
+            if factory is None:
+                from gtm.twenty import ExistingHelpersClient
+                factory = ExistingHelpersClient
+            try:
+                collectors.append(TwentyEvidence(factory(Path(paths['helper_dir']), Path(paths['key_path'])), own=(CODE,)))
+            except Exception:
+                collectors.append(Unconfigured('twenty'))
+        else:
+            collectors.append(Unconfigured('twenty'))
+    return CombinedEvidence(*collectors), collectors[0]
 
 
 def main():
@@ -55,7 +78,8 @@ def main():
     allowed = tuple(permission.get('allowed_sources', ()))
     store = PrepStore(private_dir(args.state) / 'prep.sqlite3')
     commitments = CommitmentStore(private_dir(args.state) / 'commitments.sqlite3')
-    reads, evidence, sender = CalendarReads(), MailEvidence(), PrivateSender(args.state)
+    reads, sender = CalendarReads(), PrivateSender(args.state)
+    evidence, _ = build_evidence(permission, allowed)
     while True:
         try:
             report = tick(reads, store, sender, evidence, evidence_drafter, now=dt.datetime.now(dt.timezone.utc),

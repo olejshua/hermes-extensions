@@ -36,6 +36,7 @@ class CalendarReads:
 
 class MailEvidence:
     """Subject and snippet of recent threads with the event's outside attendees."""
+    name = 'mail'
 
     def __init__(self, reads=None, per_address=3, own=(CODE,)):
         self.reads, self.per_address, self.own = reads or ExistingReads(), per_address, {a.casefold() for a in own}
@@ -73,9 +74,19 @@ class TwentyEvidence:
     A person counts only if an exact attendee address is on the returned record,
     so a filter that matches loosely cannot attach someone else's facts. Truncated
     result pages are skipped, not guessed. CRM text is data: control characters are
-    stripped and length is bounded. The filter shape is the standard Twenty one and
-    has not been run against the live server.
+    stripped and length is bounded.
+
+    Contract sources (not a live run): the filter form {emails:{primaryEmail:{eq}}}
+    is used by Twenty's own partners app source, the additionalEmails like-filter
+    appears in twentyhq/twenty issue 12965, jobTitle in the server's person field
+    list, and pageInfo/stage/closeDate/companyId filters match this repo's existing
+    queries. Twenty's docs say every workspace has its own schema, so the first
+    collect checks the live metadata for the fields used and refuses if any is
+    missing. Results stay an address-checked subset, not a completeness proof.
     """
+    name = 'twenty'
+    REQUIRED = {'person': {'name', 'emails', 'jobTitle', 'company'},
+                'opportunity': {'name', 'stage', 'closeDate', 'company'}}
     PERSON = ('query($filter:PersonFilterInput!){people(first:5,filter:$filter){pageInfo{hasNextPage} '
               'edges{node{id companyId name{firstName lastName} jobTitle emails{primaryEmail additionalEmails} '
               'company{name}}}}}')
@@ -84,6 +95,20 @@ class TwentyEvidence:
 
     def __init__(self, client, own=(CODE,)):
         self.client, self.own = client, {a.casefold() for a in own}
+        self.schema_ok = False
+
+    def _check_schema(self):
+        if self.schema_ok:
+            return
+        objects = self.client.metadata()
+        for kind, needed in self.REQUIRED.items():
+            matches = [o for o in objects if o.get('nameSingular') == kind and o.get('isActive')]
+            if len(matches) != 1:
+                raise ReviewRequired('twenty_schema_object_missing')
+            have = {f.get('name') for f in matches[0].get('fields', []) if f.get('isActive')}
+            if not needed <= have:
+                raise ReviewRequired('twenty_schema_field_missing')
+        self.schema_ok = True
 
     @staticmethod
     def _clean(value, limit=120):
@@ -95,9 +120,14 @@ class TwentyEvidence:
         addresses = sorted({a['email'].casefold() for a in event.get('attendees', [])
                             if a.get('email') and not a.get('self') and not a.get('resource')
                             and a['email'].casefold() not in self.own and _ADDRESS.fullmatch(a['email'])})
+        if not addresses:
+            return []
+        self._check_schema()
         items, seen_companies = [], set()
         for address in addresses[:6]:
-            found = self.client.query(self.PERSON, {'filter': {'emails': {'primaryEmail': {'eq': address}}}})['people']
+            match = {'or': [{'emails': {'primaryEmail': {'eq': address}}},
+                            {'emails': {'additionalEmails': {'like': '%' + address + '%'}}}]}
+            found = self.client.query(self.PERSON, {'filter': match})['people']
             if found.get('pageInfo', {}).get('hasNextPage'):
                 continue
             for row in found.get('edges', []):
@@ -124,21 +154,44 @@ class TwentyEvidence:
         return items
 
 
-class CombinedEvidence:
-    """Several permitted collectors behind the one collect() the daemon expects.
+class Evidence(list):
+    """Collected items plus the sources that could not be read."""
 
-    Any collector failure propagates so the daemon's existing source-failure
-    degradation applies; a partial note is never presented as complete.
+    def __init__(self, items=(), failed_sources=()):
+        super().__init__(items)
+        self.failed_sources = tuple(failed_sources)
+
+
+class CombinedEvidence:
+    """Several collectors behind the one collect() the daemon expects.
+
+    A failing collector never discards what the others verified: its name goes
+    into failed_sources so the note states the gap instead of implying coverage.
     """
 
     def __init__(self, *collectors):
         self.collectors = collectors
 
     def collect(self, event, allowed):
-        items = []
+        items, failed = [], []
         for collector in self.collectors:
-            items.extend(collector.collect(event, allowed))
-        return items
+            try:
+                items.extend(collector.collect(event, allowed))
+            except Exception:
+                failed.append(getattr(collector, 'name', 'unknown'))
+        return Evidence(items, failed)
+
+
+class Unconfigured:
+    """Placeholder for an allowed source that has no private configuration: always a named gap."""
+
+    def __init__(self, name):
+        self.name = name
+
+    def collect(self, event, allowed):
+        if self.name in {a.casefold() for a in allowed}:
+            raise ReviewRequired(self.name + '_not_configured')
+        return []
 
 
 def evidence_drafter(event, evidence):

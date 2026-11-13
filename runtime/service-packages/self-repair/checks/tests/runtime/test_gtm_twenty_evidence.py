@@ -3,16 +3,30 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / 'brain/src'))
-from gtm.prep_adapters import CombinedEvidence, TwentyEvidence
+from gtm.briefing_daemon import ReviewRequired
+from gtm.prep_adapters import CombinedEvidence, TwentyEvidence, Unconfigured
+from gtm.prep_daemon_entry import build_evidence
 from gtm.prep_daemon import permitted_evidence, validate_draft
 
 EVENT = {'attendees': [{'email': 'me@example.invalid', 'self': True}, {'email': 'D@outside.invalid'},
                        {'email': 'room@x.invalid', 'resource': True}, {'email': 'bad address'}]}
 
 
+class MailStub:
+    name = 'mail'
+
+    def collect(self, event, allowed):
+        return []
+
+
 class Client:
-    def __init__(self, people=None, opps=None, fail=False):
-        self.calls, self.people, self.opps, self.fail = [], people, opps, fail
+    def __init__(self, people=None, opps=None, fail=False, drop_field=None):
+        self.calls, self.people, self.opps, self.fail, self.drop = [], people, opps, fail, drop_field
+
+    def metadata(self):
+        fields = {'person': ['name', 'emails', 'jobTitle', 'company'], 'opportunity': ['name', 'stage', 'closeDate', 'company']}
+        return [{'nameSingular': k, 'isActive': True,
+                 'fields': [{'name': f, 'isActive': True} for f in v if f != self.drop]} for k, v in fields.items()]
 
     def query(self, document, variables=None):
         from gtm.twenty import validate_read_query
@@ -37,7 +51,8 @@ class TwentyEvidenceTests(unittest.TestCase):
     def test_only_outside_attendee_addresses_are_queried_and_items_cite_records(self):
         client = Client()
         items = TwentyEvidence(client).collect(EVENT, ('twenty',))
-        self.assertEqual([v['filter']['emails']['primaryEmail']['eq'] for d, v in client.calls[:1]], ['d@outside.invalid'])
+        self.assertEqual(client.calls[0][1]['filter']['or'][0], {'emails': {'primaryEmail': {'eq': 'd@outside.invalid'}}})
+        self.assertEqual(client.calls[0][1]['filter']['or'][1], {'emails': {'additionalEmails': {'like': '%d@outside.invalid%'}}})
         self.assertEqual(len(client.calls), 2)
         self.assertEqual([i['ref'] for i in items], ['twenty:person:p1', 'twenty:opportunity:o1'])
         self.assertIn('Dana Fiktiv, CTO bei Fiktiv GmbH', items[0]['text'])
@@ -65,15 +80,60 @@ class TwentyEvidenceTests(unittest.TestCase):
         self.assertNotIn('\n', item['text'])
         self.assertLessEqual(len(item['text']), 120)
 
-    def test_source_failure_propagates_through_combined_collector(self):
+    def test_failed_source_keeps_other_verified_evidence_and_names_the_gap(self):
         class Mail:
+            name = 'mail'
+
             def collect(self, event, allowed):
                 return [dict(source='mail', ref='mail:1', text='m')]
-        combined = CombinedEvidence(Mail(), TwentyEvidence(Client(fail=True)))
-        with self.assertRaises(RuntimeError):
-            combined.collect(EVENT, ('mail', 'twenty'))
+        result = CombinedEvidence(Mail(), TwentyEvidence(Client(fail=True))).collect(EVENT, ('mail', 'twenty'))
+        self.assertEqual([i['ref'] for i in result], ['mail:1'])
+        self.assertEqual(result.failed_sources, ('twenty',))
         ok = CombinedEvidence(Mail(), TwentyEvidence(Client())).collect(EVENT, ('mail', 'twenty'))
-        self.assertEqual([i['source'] for i in ok], ['mail', 'twenty', 'twenty'])
+        self.assertEqual(([i['source'] for i in ok], ok.failed_sources), (['mail', 'twenty', 'twenty'], ()))
+
+    def test_missing_workspace_field_refuses_instead_of_guessing(self):
+        client = Client(drop_field='jobTitle')
+        with self.assertRaises(ReviewRequired):
+            TwentyEvidence(client).collect(EVENT, ('twenty',))
+        self.assertEqual(client.calls, [])
+
+    def test_daemon_note_states_failed_source_and_keeps_calendar_and_mail(self):
+        from gtm.prep_daemon import _render
+        class Mail:
+            name = 'mail'
+
+            def collect(self, event, allowed):
+                return [dict(source='mail', ref='mail:1', text='Verlauf: Pilot')]
+        event = dict(EVENT, summary='Call', start={'dateTime': '2026-11-20T10:00:00+01:00'})
+        evidence = CombinedEvidence(Mail(), TwentyEvidence(Client(fail=True)))
+        report = {'rendered': 0, 'review': 0}
+        from gtm.prep_adapters import evidence_drafter
+        note = _render(None, evidence, evidence_drafter, event, ('mail', 'twenty'), 'Europe/Berlin', report)
+        self.assertEqual(report['rendered'], 1)
+        text = note if isinstance(note, str) else str(note)
+        self.assertIn('Nicht erreichbar, daher unvollständig: twenty', text)
+        self.assertIn('Verlauf: Pilot', text)
+
+    def test_entry_builds_disabled_gap_collectors_without_reading(self):
+        built = []
+        evidence, _ = build_evidence({}, ('mail',), client_factory=lambda *a: built.append(a), mail=MailStub())
+        self.assertEqual([c.name for c in evidence.collectors], ['mail'])
+        evidence, _ = build_evidence({}, ('mail', 'twenty'), mail=MailStub())
+        self.assertIsInstance(evidence.collectors[1], Unconfigured)
+        self.assertEqual(built, [])
+        with self.assertRaises(ReviewRequired):
+            evidence.collectors[1].collect(EVENT, ('twenty',))
+        self.assertEqual(evidence.collectors[1].collect(EVENT, ('mail',)), [])
+
+    def test_entry_wires_twenty_only_with_allowed_source_and_private_paths(self):
+        made = []
+        permission = {'twenty': {'helper_dir': '/private/h', 'key_path': '/private/k'}}
+        evidence, _ = build_evidence(permission, ('mail',), client_factory=lambda *a: made.append(a) or Client(), mail=MailStub())
+        self.assertEqual(made, [])
+        evidence, _ = build_evidence(permission, ('mail', 'twenty'), client_factory=lambda *a: made.append(a) or Client(), mail=MailStub())
+        self.assertEqual(len(made), 1)
+        self.assertIsInstance(evidence.collectors[1], TwentyEvidence)
 
     def test_unallowed_twenty_items_are_dropped_by_the_daemon_filter(self):
         items = TwentyEvidence(Client()).collect(EVENT, ('twenty',))

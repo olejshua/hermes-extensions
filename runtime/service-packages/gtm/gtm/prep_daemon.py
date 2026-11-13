@@ -205,12 +205,16 @@ def tick(reads, store, sender, evidence, drafter, *, now, config=None, allowed_s
 def _render(reads, evidence, drafter, event, allowed_sources, tz, report):
     try:
         try:
-            raw, failed = evidence.collect(event, tuple(allowed_sources)), False
+            raw = evidence.collect(event, tuple(allowed_sources))
+            failed_sources = tuple(getattr(raw, 'failed_sources', ()))
+            failed = False
         except Exception:  # source rejected or unreachable: say so, still prepare from the calendar
-            raw, failed = [], True
+            raw, failed, failed_sources = [], True, ()
         items, dropped = permitted_evidence(raw, allowed_sources)
         gaps = ['Eine freigegebene Quelle war nicht erreichbar.'] if failed else (
             ['Keine freigegebene Quelle lieferte Kontext.'] if not items else [])
+        if failed_sources:
+            gaps.append('Nicht erreichbar, daher unvollständig: ' + ', '.join(failed_sources) + '.')
         if dropped:
             gaps.append('Nicht freigegebene Quellen wurden nicht verwendet: ' + ', '.join(dropped) + '.')
         note = prepare_note(event, items, drafter, gaps, tz)
