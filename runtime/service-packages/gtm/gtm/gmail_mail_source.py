@@ -103,3 +103,18 @@ def thread_fingerprint(service, owner_address, thread_id):
                      hashlib.sha256(content.encode()).hexdigest()])
     rows.sort()
     return hashlib.sha256(json.dumps(rows).encode()).hexdigest(), len(rows)
+
+
+def recent_sent_thread_ids(service, owner_address, *, days=2, limit=10):
+    """Threads with an own sent message in the last `days` (users.messages.list, labelIds SENT, documented q syntax).
+    Bounded to `limit`. Only identifies candidates; every thread is read in full again before use."""
+    verified_profile(service, owner_address)
+    if type(days) is not int or not 1 <= days <= 30 or type(limit) is not int or not 1 <= limit <= 50:
+        raise ValueError('bounded_days_and_limit_required')
+    listing = service.users().messages().list(userId='me', labelIds=['SENT'], q=f'newer_than:{days}d', maxResults=limit).execute()
+    seen = []
+    for ref in listing.get('messages', []) if isinstance(listing, dict) else []:
+        tid = ref.get('threadId') if isinstance(ref, dict) else None
+        if tid and tid not in seen:
+            seen.append(tid)
+    return seen[:limit]

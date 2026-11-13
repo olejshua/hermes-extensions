@@ -82,6 +82,37 @@ def build_drafter(permission, complete_factory=None, ledger=None):
     return ModelPrepDrafter(complete_factory(permission), mode, transmission_approved=True, ledger=ledger, scope=scope)
 
 
+def proposal_section(permission, allowed, proposals, commitments, *, activate, service_factory=None, complete_factory=None,
+                     ledger=None):
+    """Mail-commitment proposals for the owner-private note. Returns (text, report).
+
+    Reads and model use happen only when 'mail_commitments' is allowed AND synthesis is configured and
+    approved (propose_from_thread stays disabled otherwise). reconcile() only runs when activated.
+    Rendering never sends or commits anything."""
+    from gtm.commitment_proposals import propose_from_thread, reconcile, render_pending
+    from gtm.gmail_mail_source import recent_sent_thread_ids
+    report = {'proposed': 0, 'reconciled': None, 'status': 'render_only'}
+    names = {a.casefold() for a in allowed}
+    cfg = permission.get('synthesis') or {}
+    if 'mail_commitments' in names and service_factory and complete_factory and cfg.get('mode') in ('dry_run', 'on'):
+        if cfg.get('transmission_approved') is not True or ledger is None:
+            raise ReviewRequired('synthesis_not_approved_or_no_ledger')
+        if cfg['mode'] == 'on' and not activate:
+            raise ReviewRequired('model_mode_on_requires_activation')
+        service = service_factory()
+        owner = CODE
+        scope = '|'.join((str(permission.get('owner')), 'openai-codex', str(cfg.get('model')), 'mail'))
+        complete = complete_factory(permission)
+        for thread_id in recent_sent_thread_ids(service, owner):
+            res = propose_from_thread(service, owner, thread_id, proposals, complete=complete, mode=cfg['mode'],
+                                      transmission_approved=True, ledger=ledger, scope=scope)
+            report['proposed'] += res.get('proposed', 0)
+        report['status'] = 'collected'
+    if activate:
+        report['reconciled'] = reconcile(proposals, commitments)
+    return render_pending(proposals), report
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--activate', action='store_true')
@@ -112,6 +143,9 @@ def main():
                           config=config, allowed_sources=allowed, own_addresses=(CODE,), activate=args.activate)
             print(json.dumps({k: v for k, v in report.items() if k != 'notes'}), flush=True)
             if 'commitments' in allowed:
+                from gtm.commitment_proposals import ProposalStore
+                note, prep = proposal_section(permission, allowed, ProposalStore(private_dir(args.state) / 'proposals.sqlite3'), commitments, activate=args.activate)
+                print(json.dumps({'proposals': prep, 'pending': bool(note)}), flush=True)
                 done = commitment_tick(commitments, sender, dt.datetime.now(dt.timezone.utc), ZoneInfo('Europe/Berlin'), activate=args.activate)
                 print(json.dumps({k: v for k, v in done.items() if k != 'message'}), flush=True)
         except Exception:

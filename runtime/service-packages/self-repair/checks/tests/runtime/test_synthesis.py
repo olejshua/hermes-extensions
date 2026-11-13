@@ -59,6 +59,24 @@ class Prep(unittest.TestCase):
             self.assertEqual(len(c.calls), 1); self.assertEqual(d.last_report['status'], 'already_attempted')
             self.assertNotIn('Laut Beleg', json.dumps(out, ensure_ascii=False))
 
+    def test_different_events_each_get_their_own_attempt_and_idless_events_do_not_collide(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            c, d = self._drafter(tmp)
+            d(dict(EVENT, id='e1'), EVID); d(dict(EVENT, id='e2'), EVID)
+            self.assertEqual(len(c.calls), 2)
+            d(EVENT, EVID)                                    # no id: refused, never shares a key
+            self.assertEqual((len(c.calls), d.last_report['status']), (2, 'no_event_identity'))
+
+    def test_provider_model_config_scopes_are_isolated(self):
+        import tempfile
+        from gtm.synthesis import ModelLedger
+        with tempfile.TemporaryDirectory() as tmp:
+            led = ModelLedger(Path(tmp) / 'l.db'); c = model(GOOD)
+            for scope in ('o|openai-codex|m1|prep', 'o|openai-codex|m2|prep'):
+                ModelPrepDrafter(c, 'on', transmission_approved=True, ledger=led, scope=scope)(dict(EVENT, id='e1'), EVID)
+            self.assertEqual(len(c.calls), 2)
+
     def test_changed_evidence_and_reschedule_do_not_reset_the_bound(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:

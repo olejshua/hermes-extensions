@@ -138,6 +138,10 @@ class ModelPrepDrafter:
             self.last_report = dict(mode=self.mode, status='not_run')
             return fallback
         by_ref = {e['ref']: e['text'] for e in evidence}
+        if self.ledger is not None and not str(event.get('id') or '').strip():
+            # without a stable subject every such event would share one key: refuse rather than collide
+            self.last_report = dict(mode=self.mode, status='no_event_identity')
+            return fallback
         if self.ledger is not None and not self.ledger.claim(attempt_key('prep', self.scope, event.get('id')), attempt_key(*sorted(by_ref.items()))):
             self.last_report = dict(mode=self.mode, status='already_attempted')
             return fallback
