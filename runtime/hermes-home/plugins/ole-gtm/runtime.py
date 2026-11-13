@@ -313,6 +313,7 @@ class CallRuntime:
         self.source_lock=threading.RLock()
         self.continuation=Continuation(self)
         self.followup_drafts_enabled=False
+        self.commitment_store=None  # Set by the reviewed entry point; owner-only reminders, no outbound effect.
     def prepare(self, args, *, session_id=None, require_model_proof=False, _request_key=None):
         if args.get('manual_completed') is not True or not isinstance(args.get('manual_request_id'),str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,128}',args['manual_request_id']):
             raise ValueError('manual_completed_request_required')
@@ -476,6 +477,13 @@ class CallRuntime:
         with os.fdopen(fd,'wb') as handle:
             fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)
             return self._finalize(workflow_id,raw,session_id=session_id)
+    def _record_commitments(self, analysis):
+        """Owner-assigned evidenced items only; a store problem never fails the saved analysis."""
+        if self.commitment_store is None:return dict(state='not_configured')
+        try:
+            from gtm.commitments import record_call_commitments
+            return dict(state='recorded',refs=record_call_commitments(self.commitment_store,analysis))
+        except Exception:return dict(state='unavailable',write_replayed=False)
     def _finalize(self, workflow_id, raw=None, *, session_id=None):
         identity,binding,transcript,directory=self.identity(workflow_id)
         if self.requests.cancelled(workflow_id):raise ValueError('manual_call_cancelled')
@@ -519,6 +527,7 @@ class CallRuntime:
         exclusive(directory/'analysis.sha256',analysis_hash.encode())
         feedback=dict(full_source_model_input_verified=model_input_verified(directory,identity),coaching=[asdict(point) for point in analysis.coaching],coaching_report=coaching_report(analysis),analysis_hash=analysis_hash)
         exclusive(directory/'archive.md',analysis.archive_markdown().encode())
+        feedback['commitments']=self._record_commitments(analysis)
         if self.adapters is None:
             return dict(status=self.coordinator.status(identity),capabilities_missing=['notion_archive','twenty','monolith'],analysis_saved=True,**feedback)
         adapters=self.adapters(analysis,binding,directory)
