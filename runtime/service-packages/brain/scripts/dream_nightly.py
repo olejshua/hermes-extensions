@@ -128,6 +128,36 @@ def main(
         print(f"dream_health={outcome.get('health', 'unknown')}", file=sys.stderr, flush=True)
         if outcome.get("status") != "complete":
             return 0 if outcome.get("status") == "already_running" else 1
+        # Stored report delivery is independent of OpenViking sync: a sync outage must not hold it back.
+        # It runs only after a complete Dream run (failed/incomplete runs returned above).
+        report_delivery = section.get("report_delivery", {})
+        if isinstance(report_delivery, dict) and report_delivery.get("enabled") is True:
+            # Stored report goes out through the same reviewed native Python as reflections,
+            # with an attempt-bound receipt. Failure never changes the launcher's Dream outcome.
+            model_command = section.get("model", {}).get("command", [])
+            adapter = str(project / "scripts" / "dream_native_adapter.py")
+            script = project / "scripts" / "dream_report_send.py"
+            if (not isinstance(model_command, list) or adapter not in model_command
+                    or not script.is_file() or script.is_symlink()
+                    or model_command.index(adapter) != 4 or model_command[1:3] != ["-I", "-c"]):
+                print("dream_report_delivery=blocked_invalid_native_command", file=sys.stderr, flush=True)
+            else:
+                try:
+                    sent = run([*model_command[:4], str(script), "--config", str(args.config)],
+                               cwd=project, env=env, stdin=subprocess.DEVNULL, text=True,
+                               stdout=subprocess.PIPE, stderr=None, check=False, timeout=45)
+                    words = (getattr(sent, "stdout", "") or "").split()
+                    known = {"disabled", "quiet", "delivered", "blocked", "failed", "unknown"}
+                    state = words[-1] if words and words[-1] in known else "unknown"
+                    # Only a printed "delivered" (bound native receipt) with exit 0 is ok.
+                    if state == "delivered":
+                        label = "ok" if int(sent.returncode) == 0 else "not_confirmed"
+                    else:
+                        label = state
+                except subprocess.TimeoutExpired:
+                    # Outcome unknown: the send may have happened; never retried here.
+                    label = "unknown"
+                print(f"dream_report_delivery={label}", file=sys.stderr, flush=True)
         sync_command = [str(project / "scripts" / "deploy_check.sh")]
         if section.get("sync_scope") == "dreams_only":
             current_sync = now() if now is not None else dt.datetime.now(timezone)
@@ -177,23 +207,6 @@ def main(
                 run([*model_command[:position], str(script), "--config", str(args.config)],
                     cwd=project, env=env, stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL, stderr=None, check=False, timeout=45)
-            report_delivery = section.get("report_delivery", {})
-            if isinstance(report_delivery, dict) and report_delivery.get("enabled") is True:
-                # Stored report goes out through the same reviewed native Python as reflections,
-                # with an attempt-bound receipt. Failure never changes the launcher's Dream outcome.
-                model_command = section.get("model", {}).get("command", [])
-                adapter = str(project / "scripts" / "dream_native_adapter.py")
-                script = project / "scripts" / "dream_report_send.py"
-                if (not isinstance(model_command, list) or adapter not in model_command
-                        or not script.is_file() or script.is_symlink()
-                        or model_command.index(adapter) != 4 or model_command[1:3] != ["-I", "-c"]):
-                    print("dream_report_delivery=blocked_invalid_native_command", file=sys.stderr, flush=True)
-                else:
-                    sent = run([*model_command[:4], str(script), "--config", str(args.config)],
-                               cwd=project, env=env, stdin=subprocess.DEVNULL,
-                               stdout=subprocess.DEVNULL, stderr=None, check=False, timeout=45)
-                    print(f"dream_report_delivery={'ok' if int(sent.returncode)==0 else 'not_confirmed'}",
-                          file=sys.stderr, flush=True)
         # Dream publication is an independent local outbox concern. A temporary
         # OpenViking/deploy outage leaves the committed round and its retryable
         # queue intact; morning health reporting exposes that queue.

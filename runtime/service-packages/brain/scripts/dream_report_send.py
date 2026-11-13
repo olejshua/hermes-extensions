@@ -19,8 +19,9 @@ def main(argv=None):
     if sys.version_info<(3,14) or "hermes_bootstrap" not in sys.modules:
         return 1
     from hermes_second_brain.dreaming.delivery import send_stored_report
-    # No stdout. Existing no_agent/local cron must never duplicate delivery.
     result=send_stored_report(args.config,sender=prepare_native_transport())
+    # One state word on stdout for the launcher: only "delivered" means a bound native receipt.
+    print(result["state"] if result.get("state") in {"disabled","quiet","delivered","blocked","failed","unknown"} else "unknown")
     return 0 if result["state"] in {"disabled","quiet","delivered"} else 1
 
 

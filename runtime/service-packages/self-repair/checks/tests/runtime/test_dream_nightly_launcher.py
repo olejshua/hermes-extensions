@@ -51,7 +51,7 @@ class Launcher(unittest.TestCase):
 
 
 class ReportDelivery(unittest.TestCase):
-    def run_with(self, section, outcome=None, send_rc=0, sync_rc=0):
+    def run_with(self, section, outcome=None, send_rc=0, sync_rc=0, send_out='delivered', send_timeout=False):
         calls = []
         outcome = outcome or {'status': 'complete', 'health': 'ok', 'rounds': 1}
         def run(command, **kw):
@@ -59,7 +59,9 @@ class ReportDelivery(unittest.TestCase):
             if command[0].endswith('dream_sweep.sh'):
                 return subprocess.CompletedProcess(command, 0, stdout=json.dumps(outcome))
             if any(str(c).endswith('dream_report_send.py') for c in command):
-                return subprocess.CompletedProcess(command, send_rc)
+                if send_timeout:
+                    raise subprocess.TimeoutExpired(command, 45)
+                return subprocess.CompletedProcess(command, send_rc, stdout=send_out)
             if any(str(c).endswith('dream_sync.py') for c in command):
                 return subprocess.CompletedProcess(command, sync_rc)
             return subprocess.CompletedProcess(command, 0, stdout='')
@@ -88,10 +90,24 @@ class ReportDelivery(unittest.TestCase):
         self.assertEqual(sent[0][:4], ['/py', '-I', '-c', 'bootstrap'])
         self.assertIn('dream_report_delivery=ok', err)
 
-    def test_unconfirmed_send_is_logged_not_ok_and_does_not_change_exit(self):
+    def test_exit_zero_is_not_ok_without_delivered_state(self):
+        for out, label in (('disabled', 'disabled'), ('quiet', 'quiet'), ('', 'unknown'), ('weird', 'unknown'), ('unknown', 'unknown')):
+            code, _, err = self.run_with({'model': self.native(), 'report_delivery': {'enabled': True}}, send_rc=0, send_out=out)
+            self.assertEqual(code, 0); self.assertIn(f'dream_report_delivery={label}', err, msg=out)
+            self.assertNotIn('dream_report_delivery=ok', err, msg=out)
+
+    def test_delivered_word_with_failing_exit_is_not_ok(self):
         code, _, err = self.run_with({'model': self.native(), 'report_delivery': {'enabled': True}}, send_rc=1)
-        self.assertEqual(code, 0); self.assertIn('dream_report_delivery=not_confirmed', err)
-        self.assertNotIn('dream_report_delivery=ok', err)
+        self.assertIn('dream_report_delivery=not_confirmed', err); self.assertNotIn('dream_report_delivery=ok', err)
+
+    def test_sync_outage_does_not_hold_back_the_report(self):
+        code, calls, err = self.run_with({'model': self.native(), 'report_delivery': {'enabled': True}}, sync_rc=1)
+        self.assertEqual(len(self.sent(calls)), 1); self.assertIn('dream_report_delivery=ok', err)
+
+    def test_send_timeout_is_unknown_and_sync_still_runs(self):
+        code, calls, err = self.run_with({'model': self.native(), 'report_delivery': {'enabled': True}}, send_timeout=True)
+        self.assertEqual(code, 0); self.assertIn('dream_report_delivery=unknown', err)
+        self.assertIn('dream_sync.py', [n for c in calls for n in map(lambda x: Path(x).name, c)])
 
     def test_unreviewed_native_command_blocks_without_running_anything(self):
         code, calls, err = self.run_with({'model': {'command': ['/py', 'x']}, 'report_delivery': {'enabled': True}})
