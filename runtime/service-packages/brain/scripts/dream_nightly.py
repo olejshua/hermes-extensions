@@ -125,6 +125,7 @@ def main(
             outcome = json.loads((result.stdout or "").strip().splitlines()[-1])
         except (IndexError, json.JSONDecodeError):
             return 1
+        print(f"dream_health={outcome.get('health', 'unknown')}", file=sys.stderr, flush=True)
         if outcome.get("status") != "complete":
             return 0 if outcome.get("status") == "already_running" else 1
         sync_command = [str(project / "scripts" / "deploy_check.sh")]

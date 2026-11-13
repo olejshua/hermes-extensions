@@ -112,9 +112,27 @@ class SweepOutcome:
 
         return self.openviking_classified
 
+    @property
+    def health(self) -> str:
+        """Honest summary of a finished sweep.
+
+        status "complete" only means the sweep ended cleanly. A run that did no
+        round, or that saw profile errors, is not the same as a healthy run
+        that processed sessions, so reports must not call it plain success.
+        """
+
+        if self.status != "complete":
+            return self.status
+        if self.profile_failures:
+            return "degraded_profile"
+        if self.rounds == 0 and self.sessions == 0:
+            return "no_work"
+        return "ok"
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "status": self.status,
+            "health": self.health,
             "run_id": self.run_id,
             "rounds": self.rounds,
             "sessions": self.sessions,
