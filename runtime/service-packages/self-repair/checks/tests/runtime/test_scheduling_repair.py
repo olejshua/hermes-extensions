@@ -58,7 +58,7 @@ def test_safe_prewrite_recovery_verifies_latest_then_reuses_success(tmp_path):
     case['original_thread'][0]['from']='Sarah <sarah@example.invalid>'
     snapshot=dict(item=dict(account='code',id='incoming',threadId='thread'),case=copy.deepcopy(case))
     slot=case['prepared_slots'][0]
-    body=policy.label(slot)+' passt mir gut.\n\nBeste Grüße\nOle Beispiel'
+    body=policy.label(slot)+' passt mir gut.\n\nBeste Grüße\nAlex Beispiel'
     receipt=standard.assess({'thread':case['original_thread'],'draft':body},lambda *_:{
         'reply_required':True,'scheduling_required':True,'result':'ready',
         'source_quote':case['original_thread'][-1]['text'],'issues':[]})
