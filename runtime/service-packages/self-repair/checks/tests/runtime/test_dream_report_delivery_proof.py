@@ -107,5 +107,34 @@ class Native(Base):
         self.assertEqual(self.run_send(boom)['state'], 'unknown')
         self.assertIsNone(self.state()[0])
 
+class CliSend(Base):
+    def run_cli(self, enabled, sender):
+        import contextlib, io
+        from hermes_second_brain import cli
+        cfg = self.root / 'm.json'
+        cfg.write_text(json.dumps({'dreaming': {'report_delivery': {'enabled': enabled, 'target': 'telegram:123'}}}))
+        config = SimpleNamespace(allowed_telegram_user_ids={'123'}, dream_state_db=self.db)
+        real = delivery.send_stored_report
+        out = io.StringIO()
+        with patch.object(delivery, 'load_dreaming_config', lambda p: config), \
+             patch.object(delivery, 'send_stored_report', lambda path, owner=None: real(path, sender=sender, owner=owner)), \
+             contextlib.redirect_stdout(out):
+            code = cli.main(['dream-report-send', '--config', str(cfg), '--claim-owner', 'o1'])
+        return code, json.loads(out.getvalue())
+
+    def test_cli_disabled_sends_nothing_and_succeeds(self):
+        sent = []
+        code, out = self.run_cli(False, lambda a: sent.append(a))
+        self.assertEqual((code, out['state'], sent), (0, 'disabled', []))
+
+    def test_cli_delivers_once_with_receipt_and_fails_on_unknown(self):
+        code, out = self.run_cli(True, lambda a: {'success': True, 'message_id': 5})
+        self.assertEqual((code, out['state']), (0, 'delivered'))
+        self.assertEqual(self.state()[1], 'confirmed')
+        rid2 = self.store.record_report(run_id='run-y', path=self.report, fingerprint='fp2')
+        code, out = self.run_cli(True, lambda a: {'success': True})
+        self.assertEqual((code, out['state']), (1, 'unknown'))
+
+
 if __name__ == '__main__':
     unittest.main()

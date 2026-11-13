@@ -496,6 +496,9 @@ def main(argv: list[str] | None = None) -> int:
     ds.add_argument("--config", "--manifest", dest="config", type=Path, required=True)
     ds.add_argument("--json", action="store_true")
 
+    drs = sub.add_parser("dream-report-send", help="send the next stored report natively; disabled unless dreaming.report_delivery.enabled")
+    drs.add_argument("--config", "--manifest", dest="config", type=Path, required=True)
+    drs.add_argument("--claim-owner")
     dr = sub.add_parser("dream-report")
     dr.add_argument("--config", "--manifest", dest="config", type=Path, required=True)
     dr.add_argument("--claim", action="store_true")
@@ -796,6 +799,15 @@ def main(argv: list[str] | None = None) -> int:
             last = status.get("last_run") or {}
             print(f"enabled={str(status.get('enabled', False)).lower()} active={str(bool(status.get('active'))).lower()} last={last.get('status', 'never')} phase={last.get('last_phase') or '-'} openviking_classified={status.get('openviking_classified', 0)} failures={status.get('failures', 0)}")
         return 0
+    if args.cmd == "dream-report-send":
+        from .dreaming.delivery import send_stored_report
+        try:
+            result = send_stored_report(args.config, owner=args.claim_owner)
+        except Exception as exc:
+            print(f"dream-report-send: {_safe_cli_error(exc)}", file=sys.stderr)
+            return 1
+        print(_json(result))
+        return 0 if result.get("state") in ("disabled", "quiet", "delivered") else 1
     if args.cmd == "dream-report":
         delivery = None
         try:
